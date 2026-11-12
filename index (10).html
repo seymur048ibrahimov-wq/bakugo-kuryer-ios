@@ -1,0 +1,4070 @@
+<!DOCTYPE html>
+<html lang="az">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>BakuGo Kuryer</title>
+<meta name="description" content="BakuGo Kuryer — BakuGo çatdırılma platformasının kuryerləri üçün sifariş qəbulu, naviqasiya və qazanc tətbiqi.">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="BakuGo Kuryer">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<style>
+/* iOS native (Capacitor): notch / Dynamic Island və alt home-indicator üçün boşluq */
+html.ios-native .app{box-sizing:border-box;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom);}
+</style>
+<script>
+window.__isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+if (window.__isNativeApp) document.documentElement.classList.add('ios-native');
+</script>
+<script>
+/* PWA / Play Store: service worker səhifə açılan kimi qeydiyyatdan keçir (girişdən asılı deyil).
+   PWABuilder və Android (TWA) quraşdırma yoxlaması bunu tələb edir. */
+if ('serviceWorker' in navigator) {
+  window.__swReady = new Promise(function(resolve){
+    window.addEventListener('load', function(){
+      navigator.serviceWorker.register('./sw.js', { scope: './' })
+        .then(function(reg){ resolve(reg); })
+        .catch(function(e){ console.warn('SW qeydiyyatı alınmadı:', e); resolve(null); });
+    });
+  });
+}
+/* Telefonun yuxarısında (bildiriş panelində) sistem bildirişi göstərir. */
+window.showSystemNotif = async function(title, body, tag){
+  try {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return false;
+    var reg = ('serviceWorker' in navigator) ? await navigator.serviceWorker.ready : null;
+    var opts = { body: body || '', icon: 'icon-192.png', badge: 'icon-96.png', tag: tag || 'bakugo', renotify: true,
+                 vibrate: [300, 120, 300], data: { url: './' } };
+    if (reg && reg.showNotification) await reg.showNotification(title || 'BakuGo', opts);
+    else new Notification(title || 'BakuGo', opts);
+    return true;
+  } catch (e) { console.warn('Sistem bildirişi göstərilmədi:', e); return false; }
+};
+</script>
+<script>
+/* ===== GOOGLE MAPS — BakuGo xəritə qatı =====
+   Tətbiqdəki bütün xəritə yerləri (kuryer, restoran, müştəri, populyar yerlər, marşrut) Google Maps ilə işləyir.
+   Köhnə kod Leaflet üslubunda yazıldığı üçün eyni adlı funksiyalar (L.map, L.marker, L.Routing...) burada
+   Google Maps üzərində yenidən qurulub — beləliklə sifariş/izləmə məntiqinə toxunulmayıb. */
+(function(){
+  var GMAPS_KEY = 'AIzaSyAQcVU7_ac2e73cMF__xd_t40Xu2kJchF4';
+  var ready = false, queue = [];
+  function whenReady(fn){ if (ready) fn(); else queue.push(fn); }
+  window.__gmWhenReady = whenReady;
+
+  var DARK = [
+    {elementType:'geometry',stylers:[{color:'#1d2330'}]},
+    {elementType:'labels.text.fill',stylers:[{color:'#c9b98a'}]},
+    {elementType:'labels.text.stroke',stylers:[{color:'#11151d'}]},
+    {featureType:'poi',elementType:'labels.icon',stylers:[{visibility:'off'}]},
+    {featureType:'poi.park',elementType:'geometry',stylers:[{color:'#1f3a2c'}]},
+    {featureType:'road',elementType:'geometry',stylers:[{color:'#2f3848'}]},
+    {featureType:'road',elementType:'geometry.stroke',stylers:[{color:'#212a37'}]},
+    {featureType:'road.highway',elementType:'geometry',stylers:[{color:'#6b5a2a'}]},
+    {featureType:'road.highway',elementType:'geometry.stroke',stylers:[{color:'#3d3418'}]},
+    {featureType:'transit',elementType:'geometry',stylers:[{color:'#2a3140'}]},
+    {featureType:'water',elementType:'geometry',stylers:[{color:'#0b1f33'}]},
+    {featureType:'water',elementType:'labels.text.fill',stylers:[{color:'#4e6d8c'}]}
+  ];
+
+  function toLL(a, b){
+    if (Array.isArray(a)) return { lat: +a[0], lng: +a[1] };
+    if (a && typeof a === 'object') return { lat: +a.lat, lng: +a.lng };
+    return { lat: +a, lng: +b };
+  }
+  function distM(a, b){
+    var R = 6371000, dLat = (b.lat-a.lat)*Math.PI/180, dLng = (b.lng-a.lng)*Math.PI/180;
+    var x = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(dLng/2)*Math.sin(dLng/2);
+    return R*2*Math.atan2(Math.sqrt(x), Math.sqrt(1-x));
+  }
+
+  /* --- HTML marker (köhnə divIcon dizaynları olduğu kimi qalır) --- */
+  var HtmlOverlay = null;
+  function defineOverlay(){
+    HtmlOverlay = function(m){ this.m = m; };
+    HtmlOverlay.prototype = new google.maps.OverlayView();
+    HtmlOverlay.prototype.onAdd = function(){ this.getPanes().overlayMouseTarget.appendChild(this.m._el); };
+    HtmlOverlay.prototype.draw = function(){
+      var p = this.getProjection(); if (!p) return;
+      var pt = p.fromLatLngToDivPixel(new google.maps.LatLng(this.m._ll.lat, this.m._ll.lng)); if (!pt) return;
+      this.m._el.style.left = (pt.x - this.m._ax) + 'px';
+      this.m._el.style.top  = (pt.y - this.m._ay) + 'px';
+    };
+    HtmlOverlay.prototype.onRemove = function(){ if (this.m._el.parentNode) this.m._el.parentNode.removeChild(this.m._el); };
+  }
+
+  function Marker(ll, opts){
+    var ic = (opts && opts.icon) || { html:'<div style="width:16px;height:16px;border-radius:50%;background:#0a84ff;border:2px solid #fff"></div>', iconSize:[16,16] };
+    var sz = ic.iconSize || [0,0], an = ic.iconAnchor || [sz[0]/2, sz[1]/2];
+    this._ll = toLL(ll); this._ax = an[0]; this._ay = an[1];
+    this._el = document.createElement('div');
+    this._el.style.cssText = 'position:absolute;cursor:pointer;width:'+sz[0]+'px;height:'+sz[1]+'px;';
+    if (ic.className) this._el.className = ic.className;
+    this._el.innerHTML = ic.html || '';
+    this._map = null; this._ov = null; this._popup = null; this._iw = null;
+    var self = this;
+    this._el.addEventListener('click', function(e){ e.stopPropagation(); self.openPopup(); });
+  }
+  Marker.prototype.addTo = function(t){ if (t && t._isGroup) t._add(this); else if (t) this._attach(t); return this; };
+  Marker.prototype._attach = function(m){
+    var self = this; this._map = m; m._layers.add(this);
+    m._whenMap(function(g){ if (self._map !== m) return; if (!self._ov) self._ov = new HtmlOverlay(self); self._ov.setMap(g); });
+  };
+  Marker.prototype.remove = function(){
+    if (this._ov) this._ov.setMap(null);
+    if (this._iw) this._iw.close();
+    if (this._map) this._map._layers.delete(this);
+    this._map = null; return this;
+  };
+  Marker.prototype.setLatLng = function(a, b){ this._ll = toLL(a, b); if (this._ov) this._ov.draw(); if (this._iw) this._iw.setPosition(this._ll); return this; };
+  Marker.prototype.getLatLng = function(){ return { lat: this._ll.lat, lng: this._ll.lng }; };
+  Marker.prototype.getElement = function(){ return this._el; };
+  Marker.prototype.bindPopup = function(h){ this._popup = h; return this; };
+  Marker.prototype.openPopup = function(){
+    var self = this; if (!this._popup || !this._map) return this;
+    this._map._whenMap(function(g){
+      if (!self._iw) self._iw = new google.maps.InfoWindow({ pixelOffset: new google.maps.Size(0, -self._ay) });
+      self._iw.setContent('<div style="color:#111;font-size:13px;line-height:1.4">' + self._popup + '</div>');
+      self._iw.setPosition(self._ll); self._iw.open({ map: g });
+    });
+    return this;
+  };
+
+  function Group(){ this._isGroup = true; this._items = []; this._map = null; }
+  Group.prototype._add = function(m){ this._items.push(m); if (this._map) m._attach(this._map); };
+  Group.prototype.addTo = function(map){ var self = this; this._map = map; map._layers.add(this); this._items.forEach(function(m){ m._attach(map); }); return this; };
+  Group.prototype.remove = function(){ this._items.forEach(function(m){ m.remove(); }); if (this._map) this._map._layers.delete(this); this._map = null; return this; };
+
+  /* --- Xəritə --- */
+  function GMap(id){
+    this._el = typeof id === 'string' ? document.getElementById(id) : id;
+    this._center = { lat: 40.4093, lng: 49.8671 }; this._zoom = 13;
+    this._type = 'roadmap'; this._dark = true;
+    this._g = null; this._q = []; this._layers = new Set();
+    var self = this;
+    whenReady(function(){
+      self._g = new google.maps.Map(self._el, {
+        center: self._center, zoom: self._zoom, mapTypeId: self._type,
+        styles: (self._dark && self._type === 'roadmap') ? DARK : null,
+        disableDefaultUI: true, gestureHandling: 'greedy', clickableIcons: false, backgroundColor: '#0d0d0d'
+      });
+      var q = self._q; self._q = []; q.forEach(function(f){ try { f(self._g); } catch(e){ console.error(e); } });
+    });
+  }
+  GMap.prototype._whenMap = function(fn){ if (this._g) fn(this._g); else this._q.push(fn); };
+  GMap.prototype.setView = function(ll, z){
+    this._center = toLL(ll); if (z != null) this._zoom = z;
+    var c = this._center, zz = this._zoom;
+    this._whenMap(function(g){ g.setCenter(c); g.setZoom(zz); }); return this;
+  };
+  GMap.prototype.invalidateSize = function(){ return this; };   /* Google Maps ölçünü özü izləyir */
+  GMap.prototype.getContainer = function(){ return this._el; };
+  GMap.prototype.removeLayer = function(l){ if (l && l.remove) l.remove(); return this; };
+  GMap.prototype.setLook = function(type, dark){
+    this._type = type; this._dark = dark;
+    this._whenMap(function(g){ g.setMapTypeId(type); g.setOptions({ styles: (dark && type === 'roadmap') ? DARK : null }); });
+  };
+
+  /* --- Marşrut: əvvəl Google Directions, alınmasa OSRM (xəritədə yenə Google üzərində çəkilir) --- */
+  function googleRoute(from, to){
+    return new Promise(function(res, rej){
+      if (window.__gmDirDisabled) return rej(new Error('directions-disabled'));
+      var t = setTimeout(function(){ rej(new Error('maps-timeout')); }, 8000);
+      whenReady(function(){
+        clearTimeout(t);
+        try {
+          new google.maps.DirectionsService().route({
+            origin: from, destination: to, travelMode: google.maps.TravelMode.DRIVING, region: 'AZ'
+          }, function(r, status){
+            if (status === 'OK' && r.routes && r.routes[0]) {
+              var leg = r.routes[0].legs[0];
+              res({ meters: leg.distance.value, seconds: leg.duration.value,
+                    path: r.routes[0].overview_path.map(function(p){ return { lat: p.lat(), lng: p.lng() }; }) });
+            } else {
+              if (status === 'REQUEST_DENIED') { window.__gmDirDisabled = true; console.warn('Google Directions API aktiv deyil — OSRM işlədilir.'); }
+              rej(new Error(status));
+            }
+          });
+        } catch(e){ rej(e); }
+      });
+    });
+  }
+  function osrmRoute(from, to){
+    var url = 'https://router.project-osrm.org/route/v1/driving/' + from.lng + ',' + from.lat + ';' + to.lng + ',' + to.lat + '?overview=full&geometries=geojson';
+    return fetch(url).then(function(r){ return r.json(); }).then(function(d){
+      if (d.code !== 'Ok' || !d.routes || !d.routes[0]) throw new Error('OSRM');
+      return { meters: d.routes[0].distance, seconds: d.routes[0].duration,
+               path: d.routes[0].geometry.coordinates.map(function(c){ return { lat: c[1], lng: c[0] }; }) };
+    });
+  }
+  window.__bakugoRoute = function(from, to){
+    from = toLL(from); to = toLL(to);
+    return googleRoute(from, to).catch(function(){ return osrmRoute(from, to); });
+  };
+
+  function Routing(opts){
+    this._o = opts || {}; this._wps = []; this._map = null; this._h = {}; this._lines = [];
+    this._key = ''; this._t = 0; this._from = null; this._seq = 0;
+  }
+  Routing.prototype.addTo = function(m){ this._map = m; return this; };
+  Routing.prototype.on = function(ev, fn){ (this._h[ev] = this._h[ev] || []).push(fn); return this; };
+  Routing.prototype._emit = function(ev, d){ (this._h[ev] || []).forEach(function(f){ try { f(d); } catch(e){ console.error(e); } }); };
+  Routing.prototype.getWaypoints = function(){ return this._wps.map(function(p){ return { latLng: p }; }); };
+  Routing.prototype._clear = function(){ this._lines.forEach(function(l){ l.setMap(null); }); this._lines = []; };
+  Routing.prototype.setWaypoints = function(arr){
+    arr = (arr || []).filter(Boolean).map(function(p){ return toLL(p.latLng || p); });
+    this._wps = arr;
+    if (arr.length < 2) { this._seq++; this._clear(); this._key = ''; return this; }
+    var from = arr[0], to = arr[arr.length - 1];
+    var key = to.lat.toFixed(5) + ',' + to.lng.toFixed(5), now = Date.now();
+    var moved = this._from ? distM(this._from, from) : 1e9;
+    /* Xərcə qənaət: eyni təyinat üçün marşrut yalnız 30 san. keçəndə və ya kuryer 80 m+ hərəkət edəndə yenilənir */
+    if (key === this._key && now - this._t < 30000 && moved < 80) return this;
+    var isNew = key !== this._key;
+    this._key = key; this._t = now; this._from = from;
+    var self = this, seq = ++this._seq;
+    window.__bakugoRoute(from, to).then(function(r){
+      if (seq !== self._seq || !self._map) return;
+      self._map._whenMap(function(g){
+        self._clear();
+        var styles = (self._o.lineOptions && self._o.lineOptions.styles) || [{ color:'#0a5fd6', weight:6, opacity:0.95 }];
+        styles.forEach(function(s, i){
+          self._lines.push(new google.maps.Polyline({ path: r.path, strokeColor: s.color, strokeWeight: s.weight, strokeOpacity: s.opacity, zIndex: 10 + i, clickable: false, map: g }));
+        });
+        if (isNew && self._o.fitSelectedRoutes !== false) {
+          var b = new google.maps.LatLngBounds(); r.path.forEach(function(p){ b.extend(p); });
+          g.fitBounds(b, 60);
+        }
+      });
+      self._emit('routesfound', { routes: [{ summary: { totalDistance: r.meters, totalTime: r.seconds } }] });
+    }).catch(function(e){ console.warn('Marşrut qurulmadı:', e && e.message); });
+    return this;
+  };
+
+  window.L = {
+    map: function(id){ return new GMap(id); },
+    marker: function(ll, o){ return new Marker(ll, o); },
+    divIcon: function(o){ return o || {}; },
+    layerGroup: function(){ return new Group(); },
+    latLng: function(a, b){ return toLL(a, b); },
+    Routing: { control: function(o){ return new Routing(o); } }
+  };
+
+  window.__gmReady = function(){
+    ready = true; defineOverlay();
+    var q = queue; queue = []; q.forEach(function(f){ try { f(); } catch(e){ console.error(e); } });
+  };
+  window.gm_authFailure = function(){
+    console.error('Google Maps açarı bu ünvan üçün icazəli deyil (API key / referrer məhdudiyyəti).');
+    try { toast('⚠️ Google Maps açarı bu ünvan üçün icazəli deyil'); } catch(e){}
+  };
+  var s = document.createElement('script');
+  s.async = true;
+  s.src = 'https://maps.googleapis.com/maps/api/js?key=' + GMAPS_KEY + '&callback=__gmReady&loading=async&language=az&region=AZ&v=weekly';
+  s.onerror = function(){ console.error('Google Maps yüklənmədi (internet?)'); };
+  document.head.appendChild(s);
+})();
+</script>
+    <style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',sans-serif;}
+
+:root{--bg1:#0d0d0d;--bg2:#1a1710;--glass:rgba(0,0,0,0.35);--gold:#d4af37;--gold-light:#f3e2ab;--emerald:#0a84ff;--emerald-light:#4fc3ff;--emerald-dark:#04264d;}
+
+html,body{width:100%;height:100%;overflow:hidden;}
+body{
+background:
+radial-gradient(ellipse 80% 60% at 18% 12%, rgba(212,175,55,0.15), transparent 60%),
+radial-gradient(ellipse 70% 55% at 88% 88%, rgba(10,132,255,0.22), transparent 60%),
+radial-gradient(ellipse 55% 45% at 85% 15%, rgba(255,70,70,0.10), transparent 65%),
+linear-gradient(160deg,#050a14,#03050a 60%,#050a14);
+background-size:200% 200%, 200% 200%, 200% 200%, 100% 100%;
+animation:bgMove 14s ease infinite;
+height:100vh;
+height:100dvh; /* mobil brauzer/native WebView üçün dəqiq hündürlük (ünvan çubuğu, safe-area) */
+display:flex;
+justify-content:center;
+align-items:center;
+transition:0.4s;
+}
+body.premium{
+filter:brightness(0.96) contrast(1.08);
+}
+@keyframes bgMove{
+0%{background-position:0% 50%, 100% 50%, 0 0;}
+50%{background-position:100% 50%, 0% 50%, 0 0;}
+100%{background-position:0% 50%, 100% 50%, 0 0;}
+}
+
+/* Baza (mobil/native app): ekranı tam tutur, çərçivə/kölgə yoxdur */
+.app{
+  width:100%;
+  height:100%;
+  height:100dvh;
+  max-width:100%;
+  background:var(--glass);
+  backdrop-filter:blur(20px);
+  border-radius:0;
+  overflow:hidden;
+  position:relative;
+  box-shadow:none;
+}
+/* Yalnız geniş ekranlarda (masaüstü brauzerdə test/demo) "telefon kartı" görünüşü */
+@media (min-width:601px){
+  .app{
+    width:360px;
+    height:700px;
+    max-height:92vh;
+    border-radius:25px;
+    box-shadow:0 0 90px rgba(10,132,255,0.30), 0 0 45px rgba(212,175,55,0.25), 0 0 0 1px rgba(212,175,55,0.35), 0 30px 90px rgba(0,0,0,0.55);
+  }
+}
+
+.app::before{
+content:'';
+position:absolute;
+inset:0;
+border-radius:25px;
+padding:1.5px;
+background:linear-gradient(135deg, rgba(212,175,55,0.9), rgba(10,132,255,0.55) 30%, rgba(255,255,255,0.05) 50%, rgba(10,132,255,0.35) 70%, rgba(212,175,55,0.9));
+background-size:300% 300%;
+animation:moveGlow 6s linear infinite;
+-webkit-mask:linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+-webkit-mask-composite:xor;
+mask-composite:exclude;
+pointer-events:none;
+z-index:900;
+}
+
+.app-particles{position:absolute;inset:0;pointer-events:none;z-index:5;overflow:hidden;border-radius:inherit;}
+.app-particle{
+    position:absolute;bottom:-14px;border-radius:50%;
+    background:radial-gradient(circle at 30% 30%, #fff8e0, #d4af37 55%, transparent 75%);
+    opacity:0;
+    animation-name:riseUp;
+    animation-timing-function:ease-in;
+    animation-iteration-count:infinite;
+}
+
+.header{display:flex;justify-content:space-between;padding:20px;color:white;position:relative;z-index:10;}
+.icon{width:45px;height:45px;border-radius:50%;background:rgba(255,255,255,0.14);backdrop-filter:blur(10px);border:1px solid rgba(212,175,55,0.35);display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 4px 15px rgba(0,0,0,0.25), inset 0 0 10px rgba(255,255,255,0.06);transition:0.25s;}
+.icon:active{transform:scale(0.92);box-shadow:0 0 18px rgba(10,132,255,0.55);}
+
+.logo-bolt{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:26px;height:26px;border-radius:50%;
+    background:radial-gradient(circle at 30% 30%,#fffbe0,#ffd23f 55%,#ff8c00);
+    font-size:15px;
+    box-shadow:0 0 12px rgba(255,210,63,0.9),0 0 22px rgba(255,140,0,0.6);
+    animation:boltPulse 1.3s ease-in-out infinite;
+}
+
+/* SET (PARAMETRLƏR) İKONU — telefonlardaki siqnal/dalğa göstəricisi tərzində */
+.wave-icon{position:relative;width:20px;height:20px;}
+.wave-dot{
+    position:absolute;bottom:0;left:50%;transform:translateX(-50%);
+    width:6px;height:6px;border-radius:50%;
+    background:#f3e2ab;
+    box-shadow:0 0 6px rgba(243,226,171,0.9);
+}
+.wave-ring{
+    position:absolute;bottom:0;left:50%;
+    border:2px solid rgba(212,175,55,0.85);
+    border-bottom:none;border-left:none;border-right:none;
+    border-top-left-radius:14px;border-top-right-radius:14px;
+    transform:translateX(-50%);
+    opacity:0;
+    animation:waveExpand 1.8s ease-out infinite;
+}
+.wave-ring1{width:14px;height:7px;animation-delay:0s;}
+.wave-ring2{width:22px;height:11px;animation-delay:0.45s;}
+@keyframes waveExpand{
+    0%{opacity:0.9;transform:translateX(-50%) scale(0.6);}
+    70%{opacity:0.3;}
+    100%{opacity:0;transform:translateX(-50%) scale(1.3);}
+}
+
+.logo{position:absolute;top:20px;left:50%;transform:translateX(-50%);color:white;font-weight:800;letter-spacing:2px;text-shadow:0 0 18px rgba(212,175,55,0.6);display:flex;align-items:center;justify-content:center;gap:8px;}
+
+.map{height:70%;position:relative;}
+#map{width:100%;height:100%;border:0;}
+
+.courier-marker-3d {
+    width: 26px !important;
+    height: 26px !important;
+    background: radial-gradient(circle at 30% 30%, #eaf6ff, #0a84ff 55%, #003a75);
+    border-radius: 50%;
+    border: 2px solid #ffffff;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.25), 0 0 18px rgba(10,132,255,0.75), inset 0 -4px 4px rgba(0,0,0,0.15);
+    transform: perspective(100px) rotateX(20deg);
+    animation: courierGlow 2s ease-in-out infinite;
+}
+@keyframes courierGlow{
+0%{box-shadow:0 4px 10px rgba(0,0,0,0.25),0 0 12px rgba(10,132,255,0.5),inset 0 -4px 4px rgba(0,0,0,0.15);}
+50%{box-shadow:0 4px 10px rgba(0,0,0,0.25),0 0 26px rgba(10,132,255,0.9),inset 0 -4px 4px rgba(0,0,0,0.15);}
+100%{box-shadow:0 4px 10px rgba(0,0,0,0.25),0 0 12px rgba(10,132,255,0.5),inset 0 -4px 4px rgba(0,0,0,0.15);}
+}
+
+/* KURYER İSTİQAMƏT (YÖN) İŞARƏSİ */
+.courier-wrap{
+    width:40px;height:40px;
+    position:relative;
+    transition: transform 0.35s linear;
+    transform-origin: 50% 50%;
+}
+.courier-circle{
+    position:absolute;
+    top:10px;left:10px;
+    width:20px;height:20px;
+    border-radius:50%;
+    background:radial-gradient(circle at 30% 30%,#eaf6ff,#0a84ff 55%,#003a75);
+    border:2px solid #ffffff;
+    box-shadow:0 4px 10px rgba(0,0,0,0.25),0 0 18px rgba(10,132,255,0.75),inset 0 -4px 4px rgba(0,0,0,0.15);
+    animation: courierGlow 2s ease-in-out infinite;
+}
+.courier-arrow{
+    position:absolute;
+    top:-3px;left:50%;
+    width:0;height:0;
+    border-left:7px solid transparent;
+    border-right:7px solid transparent;
+    border-bottom:12px solid #0a84ff;
+    transform:translateX(-50%);
+    filter:drop-shadow(0 0 6px rgba(10,132,255,0.9));
+}
+
+/* POPULYAR YERLƏR (KFC / McDonald's / Mall / Wolt tərəfdaşı) — ALOVLU GÖSTƏRİCİ */
+.hotspot-marker{
+    width:34px;height:34px;
+    border-radius:50% 50% 50% 4px;
+    background:radial-gradient(circle at 30% 30%, #fff6d0, #ff7a18 55%, #b32d00);
+    border:2px solid #ffd23f;
+    display:flex;align-items:center;justify-content:center;
+    font-size:16px;
+    box-shadow:0 0 16px rgba(255,110,0,0.7), 0 0 6px rgba(212,175,55,0.55);
+    transform:rotate(-45deg);
+    animation:hotspotFlicker 1.1s ease-in-out infinite;
+}
+.hotspot-marker span{display:block;transform:rotate(45deg);}
+@keyframes hotspotFlicker{
+    0%,100%{box-shadow:0 0 12px rgba(255,110,0,0.55),0 0 5px rgba(212,175,55,0.45);transform:rotate(-45deg) scale(1);}
+    50%{box-shadow:0 0 24px rgba(255,140,0,0.95),0 0 12px rgba(212,175,55,0.8);transform:rotate(-45deg) scale(1.1);}
+}
+
+/* LÜKS AĞ-QIZIL XƏRİTƏ ÇƏRÇİVƏSİ (Premium) */
+.map::after{
+content:'';
+position:absolute;
+inset:0;
+pointer-events:none;
+box-shadow: inset 0 0 50px rgba(10,60,120,0.18), inset 0 0 2px rgba(10,132,255,0.5), inset 0 0 0 2px rgba(212,175,55,0.35);
+border-bottom: 1px solid rgba(212,175,55,0.45);
+z-index:400;
+}
+.map::before{
+content:'';
+position:absolute;
+top:0;left:0;right:0;
+height:70px;
+background:linear-gradient(180deg, rgba(255,255,255,0.55), rgba(255,255,255,0));
+pointer-events:none;
+z-index:401;
+}
+.map{
+box-shadow: inset 0 0 0 1px rgba(212,175,55,0.25);
+}
+#map{ filter: saturate(1.35) contrast(1.08) brightness(1.02); }
+.map-vignette{
+    position:absolute; inset:0; pointer-events:none; z-index:402;
+    background:
+        radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,0.16) 100%),
+        linear-gradient(180deg, rgba(0,0,0,0.10) 0%, rgba(0,0,0,0) 12%, rgba(0,0,0,0) 85%, rgba(0,0,0,0.14) 100%);
+}
+
+.switch{position:absolute;bottom:20px;width:90%;left:5%;height:60px;background:linear-gradient(160deg,#141414,#0a0a0a);border-radius:40px;display:flex;align-items:center;padding:5px;cursor:pointer;border:1px solid rgba(212,175,55,0.25);box-shadow:0 10px 30px rgba(0,0,0,0.5), inset 0 0 15px rgba(212,175,55,0.06);z-index:10;}
+
+.slider{width:50%;height:50px;background:linear-gradient(160deg,#2a2a2a,#1a1a1a);border:1px solid rgba(212,175,55,0.3);border-radius:40px;position:absolute;left:5px;display:flex;align-items:center;justify-content:center;color:#d4af37;font-weight:700;letter-spacing:1px;transition:0.3s;}
+
+.slider.premium{
+background:linear-gradient(90deg,#0a84ff,#4fc3ff,#d4af37,#0a84ff);
+background-size:300% 300%;
+animation:pulse 1.2s infinite, moveGlow 2.4s linear infinite, floatMove 2s ease-in-out infinite;
+color:#04140d;
+box-shadow:0 0 15px #0a84ff,0 0 40px rgba(212,175,55,0.6);
+
+}
+
+@keyframes pulse{
+0%{transform:scale(1);}
+50%{transform:scale(1.08);}
+100%{transform:scale(1);}
+}
+
+#onlinePanel{position:absolute;bottom:-100%;left:0;width:100%;height:65%;background:#0a0a0a;border-radius:30px 30px 0 0;transition:0.4s;padding:25px;color:white;text-align:center;
+    z-index:999;
+}
+#onlinePanel.active{bottom:0;}
+
+.welcome{font-size:20px;margin-bottom:15px;color:#4fc3ff;font-weight:bold;}
+
+.big-card{background:linear-gradient(160deg,#151515,#0a0a0a);padding:18px;border-radius:15px;margin:10px 0;cursor:pointer;display:flex;align-items:center;gap:10px;border:1px solid rgba(212,175,55,0.2);box-shadow:0 8px 25px rgba(0,0,0,0.4);transition:0.25s;}
+.big-card:active{transform:scale(0.97);box-shadow:0 0 20px rgba(10,132,255,0.4);}
+    
+.welcomeText{
+font-size:20px;
+margin-bottom:15px;
+color:#4fc3ff;
+font-weight:bold;
+}
+.status-text{position:absolute;bottom:90px;width:100%;text-align:center;font-size:18px;color:white;opacity:0;transition:0.4s;}
+.status-text.active{opacity:1;color:#4fc3ff;}
+
+#account{position:absolute;top:0;left:-100%;width:100%;height:100%;background:#000;color:#fff;transition:0.4s;padding:20px;z-index:1000;overflow:auto;}
+#account.active{left:0;}
+
+.btn{background:linear-gradient(160deg,#141414,#0c0c0c);padding:15px;border-radius:15px;margin:10px 0;cursor:pointer;display:flex;align-items:center;gap:14px;border:1px solid rgba(212,175,55,0.16);transition:0.25s;font-weight:600;letter-spacing:0.2px;}
+.btn:hover{border-color:rgba(10,132,255,0.5);}
+
+/* PREMIUM İKON NİŞANLARI (account/menyu düymələri üçün) */
+.btn-icon{
+    width:40px;height:40px;min-width:40px;border-radius:50%;
+    display:flex;align-items:center;justify-content:center;
+    font-size:18px;
+    background:linear-gradient(145deg,#2a2410,#141108);
+    border:1px solid rgba(212,175,55,0.45);
+    box-shadow:0 3px 10px rgba(0,0,0,0.45), inset 0 0 10px rgba(212,175,55,0.18);
+    transition:0.25s;
+}
+.btn-icon.blue{
+    background:linear-gradient(145deg,#0d2a45,#04162b);
+    border:1px solid rgba(10,132,255,0.5);
+    box-shadow:0 3px 10px rgba(0,0,0,0.45), inset 0 0 10px rgba(10,132,255,0.25);
+}
+.btn-icon.danger{
+    background:linear-gradient(145deg,#401212,#1a0505);
+    border:1px solid rgba(255,68,68,0.55);
+    box-shadow:0 3px 10px rgba(0,0,0,0.45), inset 0 0 10px rgba(255,68,68,0.25);
+}
+.btn:active .btn-icon{transform:scale(0.88);}
+.btn-label{flex:1;}
+.btn-chevron{opacity:0.28;font-size:19px;font-weight:400;}
+
+/* PREMİUM NAVİQASİYA PROVAYDER KARTLARI */
+.nav-provider-card{background:linear-gradient(160deg,#141414,#0c0c0c);padding:16px;border-radius:16px;margin:12px 0;cursor:pointer;display:flex;align-items:center;gap:14px;border:1px solid rgba(212,175,55,0.16);transition:0.25s;}
+.nav-provider-card:active{transform:scale(0.98);}
+.nav-provider-card .nav-check{width:24px;height:24px;min-width:24px;border-radius:50%;border:1px solid rgba(255,255,255,0.25);display:flex;align-items:center;justify-content:center;font-size:13px;color:transparent;transition:0.25s;}
+.nav-provider-card.active{border-color:#d4af37;box-shadow:0 0 18px rgba(212,175,55,0.25), inset 0 0 14px rgba(212,175,55,0.08);}
+.nav-provider-card.active .nav-check{background:linear-gradient(145deg,#f3e2ab,#d4af37);border-color:#d4af37;color:#1a1400;}
+.nav-provider-title{font-weight:800;font-size:15px;letter-spacing:0.2px;}
+.nav-provider-sub{font-size:11.5px;opacity:0.5;margin-top:2px;}
+
+/* MİNİ TOGGLE (bildiriş səsi və s.) */
+.mini-toggle{width:50px;height:28px;border-radius:20px;background:#242424;position:relative;cursor:pointer;transition:0.25s;border:1px solid rgba(212,175,55,0.25);flex-shrink:0;}
+.mini-toggle.on{background:linear-gradient(135deg,#f3e2ab,#d4af37);border-color:#d4af37;}
+.mini-toggle-dot{width:22px;height:22px;border-radius:50%;background:#0a0a0a;position:absolute;top:2px;left:2px;transition:0.25s;box-shadow:0 2px 6px rgba(0,0,0,0.4);}
+.mini-toggle.on .mini-toggle-dot{left:24px;background:#1a1400;}
+
+/* FAQ AKKORDEON */
+.faq-item{background:linear-gradient(160deg,#141414,#0c0c0c);border:1px solid rgba(212,175,55,0.14);border-radius:14px;margin-bottom:10px;overflow:hidden;}
+.faq-q{padding:14px 16px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-weight:700;font-size:13.5px;gap:10px;}
+.faq-q .faq-arrow{transition:0.25s;opacity:0.45;font-size:13px;flex-shrink:0;}
+.faq-item.open .faq-arrow{transform:rotate(180deg);}
+.faq-a{max-height:0;overflow:hidden;transition:0.3s ease;padding:0 16px;font-size:12.5px;opacity:0.68;line-height:1.6;}
+.faq-item.open .faq-a{max-height:300px;padding:0 16px 14px;}
+
+/* HESAB PANELİ ÜST BAŞLIĞI */
+.account-hero{
+    text-align:center;padding:26px 16px 22px;margin-bottom:18px;border-radius:24px;
+    background:linear-gradient(135deg, rgba(212,175,55,0.16), rgba(10,132,255,0.07) 60%), linear-gradient(160deg,#141414,#050505);
+    border:1px solid rgba(212,175,55,0.4);
+    box-shadow:0 0 34px rgba(212,175,55,0.18), inset 0 0 22px rgba(212,175,55,0.06);
+}
+.account-avatar{
+    width:66px;height:66px;border-radius:50%;margin:0 auto 12px;
+    background:linear-gradient(135deg,#fff3c4,#d4af37);
+    display:flex;align-items:center;justify-content:center;font-size:30px;
+    box-shadow:0 0 20px rgba(212,175,55,0.6);
+}
+.account-name{font-size:19px;font-weight:800;color:#fff;}
+.account-email{margin-top:5px;font-size:12.5px;color:#8fbfe8;opacity:0.9;letter-spacing:0.3px;}
+
+input{width:100%;padding:10px;margin:5px 0;border-radius:10px;border:none;}
+
+
+/* YENİLƏNMİŞ MODAL STİLLƏRİ */
+.modal{
+    position:absolute;bottom:-100%;left:0;width:100%;height:92%;background:rgba(17, 17, 17, 0.95);
+    backdrop-filter:blur(15px);color:#fff;padding:20px;border-radius:30px 30px 0 0;
+    transition: transform 0.6s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    z-index:2000; overflow-y: auto;
+    transform: translateY(100%) rotateX(10deg);
+    transform-origin: bottom;
+}
+.modal.active{bottom:0; transform: translateY(0%) rotateX(0deg); box-shadow: 0 -10px 40px rgba(10,132,255,0.25);}
+
+.close{background:red;padding:10px;border-radius:10px;text-align:center;margin-top:10px;cursor:pointer;}
+
+#splash{position:fixed;top:0;left:0;width:100%;height:100%;
+background:radial-gradient(ellipse at 50% 28%, #ffb14d 0%, #ff7a18 45%, #b33d00 100%);
+color:#fff;display:flex;flex-direction:column;justify-content:center;align-items:center;
+font-size:32px;font-weight:bold;z-index:9999;overflow:hidden;}
+
+#splashParticles{position:absolute;inset:0;pointer-events:none;z-index:1;}
+
+.splash-particle{
+position:absolute;bottom:-20px;border-radius:50%;
+background:radial-gradient(circle at 30% 30%, #fffdf3, #ffd23f 55%, transparent 75%);
+opacity:0;
+animation-name:riseUp;
+animation-timing-function:ease-in;
+animation-iteration-count:infinite;
+}
+@keyframes riseUp{
+0%{transform:translateY(0) scale(0.6); opacity:0;}
+12%{opacity:0.9;}
+75%{opacity:0.55;}
+100%{transform:translateY(-115vh) scale(1.15); opacity:0;}
+}
+
+.splash-bolt{
+position:relative;z-index:5;
+width:88px;height:88px;border-radius:50%;
+background:radial-gradient(circle at 30% 30%, #fffbe0, #ffd23f 55%, #ff8c00);
+display:flex;align-items:center;justify-content:center;
+font-size:42px;margin-bottom:16px;
+box-shadow:0 0 35px rgba(255,210,63,0.9), 0 0 70px rgba(255,120,0,0.6), inset 0 0 15px rgba(255,255,255,0.5);
+animation:boltPulse 1.3s ease-in-out infinite;
+}
+@keyframes boltPulse{0%,100%{transform:scale(1);}50%{transform:scale(1.1);}}
+
+.splash-title{position:relative;z-index:5;letter-spacing:3px;text-shadow:0 2px 12px rgba(0,0,0,0.35);}
+
+#auth{position:fixed;top:0;left:0;width:100%;height:100%;background:black;color:#d4af37;display:none;flex-direction:column;justify-content:center;align-items:center;gap:20px;z-index:9998;}
+
+#loginModal {position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.95);display:none;flex-direction:column;justify-content:center;align-items:center;z-index:9999;padding:20px;}
+.login-card {background: #111; padding: 25px; border-radius: 25px; border: 1px solid #0a84ff; width: 100%; text-align: center;}
+
+    .btn:active{
+transform:scale(0.95);
+box-shadow:0 0 20px #0a84ff;
+}
+@keyframes moveGlow{
+0%{background-position:0% 50%;}
+50%{background-position:100% 50%;}
+100%{background-position:0% 50%;}
+}
+@keyframes floatMove{
+0%{transform:translateX(0);}
+50%{transform:translateX(10px);}
+100%{transform:translateX(0);}
+}
+
+.premium-card{
+background:#0a0a0a;
+overflow:hidden;
+border-top:2px solid #d4af37;
+}
+
+.live-border{
+position:absolute;
+top:0;
+left:-100%;
+width:300%;
+height:3px;
+background:linear-gradient(
+90deg,
+transparent,
+#d4af37,
+#f3e2ab,
+transparent);
+animation:borderMove 3s linear infinite;
+}
+
+@keyframes borderMove{
+0%{left:-100%;}
+100%{left:100%;}
+}
+
+.card3d{
+width:100%;
+height:220px;
+position:relative;
+transform-style:preserve-3d;
+transition:1s;
+margin-bottom:20px;
+}
+
+.card3d.flip{
+transform:rotateY(180deg);
+}
+
+.card-face{
+position:absolute;
+width:100%;
+height:100%;
+backface-visibility:hidden;
+border-radius:25px;
+padding:20px;
+
+background:
+linear-gradient(
+145deg,
+rgba(255,255,255,0.1),
+rgba(255,255,255,0.03));
+
+backdrop-filter:blur(20px);
+
+box-shadow:
+0 0 30px rgba(212,175,55,0.35),
+inset 0 0 20px rgba(255,255,255,0.05);
+}
+
+.front{
+z-index:2;
+}
+
+.back{
+transform:rotateY(180deg);
+display:flex;
+flex-direction:column;
+justify-content:center;
+}
+
+.blackLine{
+height:50px;
+background:black;
+margin-bottom:30px;
+border-radius:10px;
+}
+
+.cvvBox{
+background:white;
+color:black;
+padding:12px;
+border-radius:10px;
+font-weight:bold;
+text-align:right;
+}
+
+.card-top{
+display:flex;
+justify-content:space-between;
+align-items:center;
+}
+
+.bank{
+font-size:20px;
+font-weight:bold;
+color:#d4af37;
+}
+
+.visaLogo{
+font-size:26px;
+}
+
+.chip{
+width:60px;
+height:40px;
+border-radius:12px;
+margin:20px 0;
+background:linear-gradient(145deg,gold,#ffcc00);
+}
+
+.card-number{
+font-size:24px;
+letter-spacing:3px;
+margin-bottom:30px;
+font-weight:bold;
+color:white;
+text-align:center;
+}
+
+.card-bottom{
+display:flex;
+justify-content:space-between;
+color:white;
+}
+
+.card-bottom span{
+font-size:12px;
+opacity:0.7;
+}
+
+.card-row{
+display:flex;
+gap:10px;
+}
+
+.card-row input{
+flex:1;
+}
+
+.premium-card input{
+width:100%;
+padding:14px;
+margin-top:12px;
+border:none;
+outline:none;
+border-radius:15px;
+background:#111;
+color:white;
+font-size:16px;
+transition:0.3s;
+}
+
+.premium-card input:focus{
+box-shadow:0 0 20px rgba(212,175,55,0.5);
+border:1px solid #d4af37;
+}
+
+.premium-card-input{
+width:100%;
+padding:14px;
+margin-top:12px;
+border:none;
+outline:none;
+border-radius:15px;
+background:#111;
+color:white;
+font-size:16px;
+border:1px solid rgba(212,175,55,0.25);
+transition:0.3s;
+}
+
+.premium-card-input:focus{
+box-shadow:0 0 20px rgba(10,132,255,0.45);
+border:1px solid #0a84ff;
+}
+
+.premiumBtn{
+margin-top:20px;
+padding:16px;
+border-radius:18px;
+font-size:18px;
+font-weight:bold;
+text-align:center;
+cursor:pointer;
+
+background:linear-gradient(
+90deg,
+#0a84ff,
+#4fc3ff,
+#d4af37,
+#0a84ff);
+
+background-size:300% 300%;
+
+animation:moveGlow 3s linear infinite;
+
+color:#04140d;
+
+box-shadow:
+0 0 20px rgba(10,132,255,0.5);
+}
+
+.balanceBox{
+margin-top:15px;
+background:#111;
+padding:15px;
+border-radius:15px;
+text-align:center;
+font-size:18px;
+color:#4fc3ff;
+font-weight:bold;
+}
+
+.premiumBtn:active{
+transform:scale(0.96);
+}
+
+/* ===== VIP QAZANC (BONUS) LÜKS DİZAYN ===== */
+#earnModal{
+background:radial-gradient(ellipse at top, #1a1408 0%, #0a0a0a 60%);
+}
+.vip-hero{
+position:relative;
+border-radius:26px;
+padding:28px 22px;
+overflow:hidden;
+text-align:center;
+background:
+linear-gradient(135deg, rgba(212,175,55,0.18), rgba(0,0,0,0.4) 60%),
+linear-gradient(160deg,#141414,#050505);
+border:1px solid rgba(212,175,55,0.55);
+box-shadow:0 0 40px rgba(212,175,55,0.25), inset 0 0 30px rgba(212,175,55,0.08);
+margin-bottom:18px;
+}
+.vip-hero::before{
+content:'';
+position:absolute;
+top:-50%;left:-60%;
+width:220%;height:220%;
+background:conic-gradient(from 0deg, transparent 0deg, rgba(255,223,128,0.18) 60deg, transparent 140deg, transparent 360deg);
+animation:vipSweep 5s linear infinite;
+}
+@keyframes vipSweep{ to{ transform:rotate(360deg); } }
+.vip-badge{
+display:inline-flex;
+align-items:center;
+gap:6px;
+padding:6px 16px;
+border-radius:30px;
+font-size:11px;
+font-weight:800;
+letter-spacing:2px;
+color:#1a1408;
+background:linear-gradient(90deg,#fff3c4,#d4af37);
+box-shadow:0 0 18px rgba(212,175,55,0.7);
+position:relative;
+z-index:2;
+}
+.vip-balance-label{
+position:relative;
+z-index:2;
+margin-top:16px;
+color:#c9b25a;
+font-size:12px;
+letter-spacing:3px;
+text-transform:uppercase;
+}
+.vip-balance-value{
+position:relative;
+z-index:2;
+font-size:44px;
+font-weight:900;
+margin-top:6px;
+background:linear-gradient(90deg,#4fc3ff,#0a84ff);
+-webkit-background-clip:text;
+background-clip:text;
+color:transparent;
+text-shadow:0 0 30px rgba(10,132,255,0.4);
+}
+.vip-sub{
+position:relative;
+z-index:2;
+margin-top:4px;
+color:#888;
+font-size:12px;
+}
+.vip-progress-wrap{
+position:relative;
+z-index:2;
+margin-top:20px;
+text-align:left;
+}
+.vip-progress-labels{
+display:flex;
+justify-content:space-between;
+font-size:11px;
+color:#c9b25a;
+margin-bottom:6px;
+letter-spacing:1px;
+}
+.vip-progress-track{
+height:8px;
+border-radius:10px;
+background:#1c1c1c;
+overflow:hidden;
+border:1px solid rgba(212,175,55,0.3);
+}
+.vip-progress-fill{
+height:100%;
+width:64%;
+border-radius:10px;
+background:linear-gradient(90deg,#d4af37,#fff3c4);
+box-shadow:0 0 12px rgba(212,175,55,0.8);
+}
+.vip-stats-row{
+display:flex;
+gap:12px;
+margin-bottom:18px;
+}
+.vip-stat-card{
+flex:1;
+background:linear-gradient(160deg,#141414,#0a0a0a);
+border:1px solid rgba(212,175,55,0.3);
+border-radius:16px;
+padding:14px 10px;
+text-align:center;
+}
+.vip-stat-card .num{
+font-size:20px;
+font-weight:800;
+color:#ffd700;
+}
+.vip-stat-card .lbl{
+font-size:10px;
+color:#999;
+letter-spacing:1px;
+margin-top:4px;
+text-transform:uppercase;
+}
+.vip-action-row{
+display:flex;
+gap:12px;
+}
+.vip-action-btn{
+flex:1;
+padding:16px 8px;
+border-radius:16px;
+text-align:center;
+font-weight:800;
+font-size:14px;
+cursor:pointer;
+color:#1a1408;
+background:linear-gradient(135deg,#fff3c4,#d4af37);
+box-shadow:0 0 20px rgba(212,175,55,0.4);
+transition:0.2s;
+}
+.vip-action-btn.outline{
+background:transparent;
+color:#d4af37;
+border:1px solid rgba(212,175,55,0.6);
+box-shadow:none;
+}
+.vip-action-btn:active{ transform:scale(0.96); }
+.vip-perk{
+display:flex;
+align-items:center;
+gap:12px;
+background:#111;
+border:1px solid rgba(212,175,55,0.2);
+border-radius:14px;
+padding:12px 14px;
+margin-top:12px;
+color:#ddd;
+font-size:13px;
+}
+.vip-perk .ico{
+width:34px;height:34px;border-radius:50%;
+display:flex;align-items:center;justify-content:center;
+background:linear-gradient(135deg,#d4af37,#7a5b00);
+font-size:16px;
+flex-shrink:0;
+}
+
+/* QAZANC TARİXÇƏSİ SƏTİRLƏRİ (hər çatdırılmış sifariş üçün) */
+.earn-item{
+    display:flex;align-items:center;gap:12px;
+    background:linear-gradient(160deg,#131313,#0a0a0a);
+    border:1px solid rgba(212,175,55,0.18);
+    border-radius:14px;
+    padding:11px 14px;
+    margin-top:8px;
+}
+.earn-item .earn-num{
+    width:30px;height:30px;min-width:30px;border-radius:50%;
+    display:flex;align-items:center;justify-content:center;
+    background:linear-gradient(135deg,#4fc3ff,#0a84ff);
+    color:#04264d;font-weight:800;font-size:13px;
+    box-shadow:0 0 10px rgba(10,132,255,0.5);
+}
+.earn-item .earn-label{flex:1;font-size:13.5px;color:#ddd;}
+.earn-item .earn-amount{font-weight:800;color:#4fc3ff;font-size:14.5px;}
+.earn-total-row{
+    display:flex;justify-content:space-between;align-items:center;
+    margin-top:14px;padding:14px;border-radius:14px;
+    background:linear-gradient(135deg, rgba(212,175,55,0.16), rgba(0,0,0,0.3));
+    border:1px solid rgba(212,175,55,0.4);
+}
+.earn-total-row .lbl{font-size:13px;color:#c9b25a;letter-spacing:1px;text-transform:uppercase;}
+.earn-total-row .val{font-size:20px;font-weight:900;color:#ffd700;}
+    
+.map{
+position:relative;
+height:70%;
+overflow:hidden;
+}
+
+#wazeMapBtn{
+position:absolute;
+right:15px;
+bottom:20px;
+width:55px;
+height:55px;
+border-radius:50%;
+background:linear-gradient(145deg,#33ccff,#0a84ff);
+display:flex;
+align-items:center;
+justify-content:center;
+font-size:26px;
+cursor:pointer;
+z-index:5;
+
+box-shadow:
+0 0 20px rgba(10,132,255,0.7);
+
+animation:gpsPulse 1.5s infinite;
+}
+
+@keyframes gpsPulse{
+
+0%{
+transform:scale(1);
+}
+
+50%{
+transform:scale(1.1);
+}
+
+100%{
+transform:scale(1);
+}
+
+}
+
+#gpsInfo{
+position:absolute;
+left:50%;
+transform:translateX(-50%);
+bottom:25px;
+
+background:rgba(255,255,255,0.9);
+
+padding:10px 18px;
+
+border-radius:20px;
+
+color:#0a5fd6;
+
+font-size:14px;
+
+backdrop-filter:blur(10px);
+
+box-shadow:0 4px 14px rgba(10,60,120,0.25);
+
+opacity:0;
+
+transition:0.4s;
+
+z-index:500;
+}
+
+#gpsInfo.active{
+opacity:1;
+}
+
+.swipe-container {
+    background: #1a1a1a;
+    padding: 5px;
+    border-radius: 50px;
+    position: relative;
+    height: 60px;
+    display: flex;
+    align-items: center;
+    border: 1px solid #333;
+    overflow: hidden;
+}
+.swipe-thumb {
+    width: 50px;
+    height: 50px;
+    background: linear-gradient(45deg, #d4af37, #f3e2ab);
+    border-radius: 50%;
+    position: absolute;
+    left: 5px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    font-size: 24px;
+    cursor: grab;
+    z-index: 2;
+    transition: left 0.1s ease-out;
+}
+.swipe-text {
+    width: 100%;
+    text-align: center;
+    color: #888;
+    user-select: none;
+    pointer-events: none;
+}
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+    .wstatus-pending{color:#ffb347;font-weight:bold;}
+    .wstatus-approved{color:#00ff66;font-weight:bold;}
+    .wstatus-rejected{color:#ff4444;font-weight:bold;}
+
+    /* ================= SİFARİŞ PƏNCƏRƏSİ — SADƏ VƏ LÜKS DİZAYN ================= */
+    .order-lux{
+        background:radial-gradient(ellipse at top, #171205 0%, #0a0a0a 55%);
+        border:1px solid rgba(212,175,55,0.35);
+        border-radius:24px;
+        padding:26px 20px 20px;
+        animation:fadeIn 0.5s ease;
+    }
+    .ol-kicker{
+        text-align:center;
+        color:#a3893f;
+        font-size:11px;
+        font-weight:800;
+        letter-spacing:4px;
+        text-transform:uppercase;
+    }
+    .ol-id{
+        text-align:center;
+        color:#555;
+        font-size:12px;
+        margin-top:5px;
+        letter-spacing:1px;
+    }
+    .ol-countdown{
+        display:none;
+        width:46px;height:46px;
+        margin:10px auto 0;
+        border-radius:50%;
+        border:3px solid #d4af37;
+        color:#f3e2ab;
+        font-size:18px;
+        font-weight:900;
+        align-items:center;
+        justify-content:center;
+        display:none;
+        box-shadow:0 0 14px rgba(212,175,55,0.35);
+        transition:border-color .3s, color .3s, box-shadow .3s;
+    }
+    .ol-countdown.show{ display:flex; }
+    .ol-countdown.urgent{
+        border-color:#ff4444;
+        color:#ff9a9a;
+        box-shadow:0 0 14px rgba(255,68,68,0.5);
+        animation:countdownPulse 0.7s ease infinite;
+    }
+    @keyframes countdownPulse{
+        0%,100%{ transform:scale(1); }
+        50%{ transform:scale(1.12); }
+    }
+    .ol-price-wrap{ text-align:center; margin-top:18px; }
+    .ol-price{
+        display:inline-block;
+        padding:11px 32px;
+        border-radius:50px;
+        font-size:26px;
+        font-weight:900;
+        letter-spacing:0.5px;
+        background:linear-gradient(90deg,#4fc3ff,#0a84ff,#d4af37);
+        color:#04140d;
+        box-shadow:0 0 25px rgba(10,132,255,0.45);
+    }
+    .ol-tabs{
+        display:flex;
+        gap:8px;
+        margin:22px 0 4px;
+    }
+    .ol-tab{
+        flex:1;
+        text-align:center;
+        padding:11px 6px;
+        border-radius:14px;
+        background:rgba(212,175,55,0.07);
+        border:1px solid rgba(212,175,55,0.25);
+        color:#d4af37;
+        font-weight:700;
+        font-size:12px;
+        letter-spacing:0.5px;
+        cursor:pointer;
+        transition:0.25s;
+    }
+    .ol-tab-active{
+        background:linear-gradient(90deg,#0a84ff,#4fc3ff);
+        color:#04140d;
+        border:1px solid rgba(10,132,255,0.6);
+        box-shadow:0 0 18px rgba(10,132,255,0.4);
+    }
+    .ol-section{ display:flex; flex-direction:column; gap:12px; margin-top:20px; }
+    .ol-card{
+        background:linear-gradient(160deg,#141414,#0c0c0c);
+        border:1px solid rgba(255,255,255,0.06);
+        border-radius:18px;
+        padding:16px;
+        display:flex;
+        gap:13px;
+        align-items:flex-start;
+    }
+    .ol-badge{
+        width:36px;height:36px;min-width:36px;
+        border-radius:11px;
+        display:flex;align-items:center;justify-content:center;
+        font-size:16px;
+        background:rgba(212,175,55,0.12);
+        border:1px solid rgba(212,175,55,0.3);
+    }
+    .ol-card-body{ flex:1; min-width:0; }
+    .ol-card-label{
+        color:#a3893f;
+        font-size:10px;
+        font-weight:800;
+        letter-spacing:2px;
+        text-transform:uppercase;
+        margin-bottom:4px;
+    }
+    .ol-card-title{ color:#fff; font-size:15px; font-weight:700; }
+    .ol-card-sub{ color:#888; font-size:12.5px; margin-top:3px; line-height:1.4; }
+    .ol-card-phone{ color:#d4af37; font-size:13px; font-weight:700; margin-top:7px; cursor:pointer; }
+    .ol-card-value{ color:#d4af37; font-size:13px; font-weight:700; margin-top:7px; }
+    .ol-items ul{ list-style:none; padding:0; }
+    .ol-items li{ display:flex; justify-content:space-between; align-items:center; gap:10px; color:#ddd; font-size:13.5px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.06); }
+    .ol-items li:last-child{ border-bottom:none; }
+    .ol-item-name{ flex:1; min-width:0; }
+    .ol-item-qty{ color:#1a1408; background:linear-gradient(90deg,#d4af37,#fff3c4); font-weight:800; font-size:12px; padding:3px 9px; border-radius:20px; white-space:nowrap; }
+    .ol-note{
+        margin-top:10px; padding:10px 12px; background:#111; border-radius:10px;
+        color:#888; font-size:12px; font-style:italic; border:1px solid rgba(255,255,255,0.05);
+    }
+    .ol-distance-strip{
+        text-align:center; color:#c9b25a; font-weight:700; font-size:15px;
+        padding:12px; background:rgba(212,175,55,0.06);
+        border:1px solid rgba(212,175,55,0.2); border-radius:14px;
+    }
+    .ol-route-info{ display:flex; gap:10px; }
+    .ol-route-chip{
+        flex:1; display:flex; align-items:center; gap:11px;
+        background:linear-gradient(160deg,rgba(212,175,55,0.12),rgba(212,175,55,0.03));
+        border:1px solid rgba(212,175,55,0.28); border-radius:16px;
+        padding:13px 14px;
+    }
+    .ol-route-icon{ font-size:21px; filter:drop-shadow(0 0 6px rgba(212,175,55,0.4)); }
+    .ol-route-data{ min-width:0; }
+    .ol-route-value{ color:#f3d97a; font-weight:800; font-size:16.5px; letter-spacing:0.3px; }
+    .ol-route-label{ color:#8a7a45; font-size:9.5px; font-weight:800; text-transform:uppercase; letter-spacing:1.2px; margin-top:2px; }
+    .ol-route-loading .ol-route-value{ animation:olPulse 1.1s ease-in-out infinite; }
+    @keyframes olPulse{ 0%,100%{ opacity:0.3; } 50%{ opacity:1; } }
+    .ol-route-pop{ animation:olPop 0.45s cubic-bezier(.34,1.56,.64,1); }
+    @keyframes olPop{ 0%{ transform:scale(0.82); opacity:0.3; } 60%{ transform:scale(1.08); opacity:1; } 100%{ transform:scale(1); } }
+    .ol-reject{ text-align:center; margin:20px 0 4px; color:#a35b5b; font-weight:600; font-size:13px; cursor:pointer; opacity:0.75; letter-spacing:0.5px; }
+    .ol-close{ margin-top:16px; background:transparent; border:1px solid rgba(255,255,255,0.1); color:#666; text-align:center; padding:12px; border-radius:14px; cursor:pointer; font-size:13px; }
+    .order-lux .swipe-container{ background:#111; border:1px solid rgba(212,175,55,0.3); margin-top:22px; }
+    .order-lux .swipe-thumb{ background:linear-gradient(45deg,#d4af37,#fff3c4); color:#1a1408; }
+    .order-lux .swipe-text{ color:#a3893f; letter-spacing:2px; font-weight:700; font-size:13px; }
+    .order-lux .premiumBtn{ background:linear-gradient(90deg,#d4af37,#fff3c4) !important; color:#1a1408 !important; box-shadow:0 0 25px rgba(212,175,55,0.3) !important; animation:none !important; }
+    .order-lux .close{ background:rgba(255,68,68,0.12); border:1px solid rgba(255,68,68,0.35); color:#ff8080; }
+    .ol-close-disabled{ opacity:0.35; pointer-events:none; }
+    .ol-shake{ animation:olShake 0.4s ease; }
+    @keyframes olShake{
+        0%,100%{ transform:translateX(0); }
+        20%{ transform:translateX(-8px); }
+        40%{ transform:translateX(8px); }
+        60%{ transform:translateX(-6px); }
+        80%{ transform:translateX(6px); }
+    }
+/* ===== TOAST BİLDİRİŞİ (native alert() əvəzinə) ===== */
+.toast-container{position:absolute;left:0;right:0;bottom:18px;display:flex;flex-direction:column;align-items:center;gap:8px;z-index:99999;pointer-events:none;padding:0 16px;}
+.toast{
+  pointer-events:auto;
+  max-width:100%;
+  background:rgba(20,20,20,0.92);
+  backdrop-filter:blur(12px);
+  border:1px solid rgba(212,175,55,0.45);
+  border-radius:14px;
+  padding:12px 16px;
+  font-size:13.5px;
+  line-height:1.4;
+  color:#f3e2ab;
+  box-shadow:0 8px 24px rgba(0,0,0,0.4);
+  opacity:0;
+  transform:translateY(12px);
+  animation:toastIn 0.25s ease forwards, toastOut 0.3s ease forwards 3.2s;
+}
+.toast.toast-error{border-color:rgba(255,90,90,0.55);color:#ffd4d4;}
+.toast.toast-success{border-color:rgba(10,132,255,0.6);color:#c8ffe6;}
+@keyframes toastIn{to{opacity:1;transform:translateY(0);}}
+@keyframes toastOut{to{opacity:0;transform:translateY(-8px);}}
+/* ===== AÇIQ REJİM (LIGHT MODE) =====
+   Tünd/qara səthlər isti narıncı tonlara keçir.
+   QEYD: .switch/.slider (onlayn düyməsi) və söhbət elementləri BURADA QƏSDƏN YOXDUR — toxunulmur. */
+body.light-mode{
+  background:
+    radial-gradient(ellipse 80% 60% at 18% 12%, rgba(255,122,0,0.18), transparent 60%),
+    radial-gradient(ellipse 70% 55% at 88% 88%, rgba(255,160,60,0.20), transparent 60%),
+    linear-gradient(160deg,#fff6ea,#ffe6c2 60%,#fff6ea);
+}
+body.light-mode .app{
+  background: rgba(255,255,255,0.5);
+}
+body.light-mode .app::before{
+  background:linear-gradient(135deg, rgba(255,122,0,0.9), rgba(255,180,80,0.55) 30%, rgba(255,255,255,0.2) 50%, rgba(255,140,0,0.5) 70%, rgba(255,122,0,0.9));
+}
+body.light-mode .header .icon,
+body.light-mode .logo,
+body.light-mode .status-text,
+body.light-mode .welcomeText,
+body.light-mode #gpsInfo{
+  color:#3a1e00;
+}
+body.light-mode .icon{
+  background: rgba(255,255,255,0.55);
+  border:1px solid rgba(255,122,0,0.45);
+}
+body.light-mode .btn,
+body.light-mode .big-card,
+body.light-mode .premium-card,
+body.light-mode .vip-hero,
+body.light-mode .vip-stat-card,
+body.light-mode .vip-perk,
+body.light-mode .login-card,
+body.light-mode #account{
+  background: rgba(255,255,255,0.6) !important;
+  color:#3a1e00 !important;
+  border-color: rgba(255,122,0,0.45) !important;
+}
+body.light-mode .modal{
+  background: rgba(255,246,234,0.97) !important;
+  color:#3a1e00 !important;
+}
+body.light-mode .close{
+  background: rgba(255,122,0,0.15) !important;
+  color:#3a1e00 !important;
+}
+body.light-mode input,
+body.light-mode select,
+body.light-mode textarea{
+  background: rgba(255,255,255,0.7) !important;
+  color:#3a1e00 !important;
+  border-color: rgba(255,122,0,0.4) !important;
+}
+body.light-mode .toast{
+  background: rgba(255,246,234,0.95);
+  color:#3a1e00;
+  border-color: rgba(255,122,0,0.5);
+}
+    </style>
+</head>
+<body ontouchstart="handleTouchStart(event)" ontouchmove="handleTouchMove(event)">
+
+<div id="splash">
+    <div id="splashParticles"></div>
+    <div class="splash-bolt">⚡</div>
+    <div class="splash-title">BAKUGO</div>
+</div>
+
+<script>
+/* BUXAR/QIĞILCIM HISSƏCİKLƏRİ — kənarlardan aşağıdan yuxarı qalxan nöqtələr (splash + tətbiq daxili) */
+function generateRisingParticles(containerId, particleClass, count){
+    var container = document.getElementById(containerId);
+    if(!container) return;
+    for(var i=0;i<count;i++){
+        var p = document.createElement('div');
+        p.className = particleClass;
+        var edge = Math.random() < 0.5 ? (Math.random()*13) : (87 + Math.random()*13);
+        p.style.left = edge + '%';
+        var size = 4 + Math.random()*7;
+        p.style.width = size + 'px';
+        p.style.height = size + 'px';
+        var dur = 2.4 + Math.random()*3;
+        p.style.animationDuration = dur + 's';
+        p.style.animationDelay = (Math.random()*3) + 's';
+        container.appendChild(p);
+    }
+}
+generateRisingParticles('splashParticles', 'splash-particle', 26);
+document.addEventListener('DOMContentLoaded', function(){
+    generateRisingParticles('appParticles', 'app-particle', 16);
+});
+</script>
+
+<script>
+/* SPLASH TƏHLÜKƏSİZLİK ŞƏBƏKƏSİ — heç bir xarici CDN-dən (Google Maps/Firebase) asılı deyil.
+   Bu skript səhifənin lap əvvəlində, hər şeydən əvvəl işə düşür ki, xarici skriptlərdən
+   biri yüklənməsə/xəta versə belə, istifadəçi qara "BAKUGO" ekranında ilişib qalmasın. */
+window.addEventListener('error', function(e){
+    console.error('BakuGo yükləmə xətası:', e.message, e.filename, e.lineno);
+});
+
+/* Native alert() qutusu əvəzinə istifadə olunan tətbiq-daxili bildiriş.
+   Mesajın məzmununa görə avtomatik uğur/xəta rəngini seçir və 3.5 san. sonra özü bağlanır. */
+/* Açıq/Qara rejim seçimi — cihazda (localStorage) yadda saxlanılır və açılışda tətbiq olunur.
+   Online düymə (switch/slider) və digər elementlərə bu funksiya HEÇ TOXUNMUR — yalnız body-yə class əlavə edir,
+   rəng dəyişikliyi tam olaraq CSS-dəki body.light-mode qaydaları ilə idarə olunur. */
+window.setAppTheme = function(mode){
+    document.body.classList.toggle('light-mode', mode === 'light');
+    try { localStorage.setItem('bakugo_courier_theme', mode); } catch(e){}
+    const lightCheck = document.getElementById('themeLightCheck');
+    const darkCheck = document.getElementById('themeDarkCheck');
+    if (lightCheck) lightCheck.style.opacity = mode === 'light' ? '1' : '0';
+    if (darkCheck) darkCheck.style.opacity = mode === 'dark' ? '1' : '0';
+    /* Xəritə (əgər artıq yüklənibsə) də dərhal eyni gecə/gündüz temasına keçir */
+    if (typeof window.refreshMapThemeStyle === 'function') window.refreshMapThemeStyle();
+};
+/* İstifadəçi manual olaraq tema seçməyibsə, saat 07:00-19:00 arası gündüz (light),
+   qalan vaxt gecə (dark) rejimi avtomatik tətbiq olunur. Manual seçim həmişə üstündür. */
+function autoThemeByTime(){
+    const h = new Date().getHours();
+    return (h >= 7 && h < 19) ? 'light' : 'dark';
+}
+(function applySavedTheme(){
+    let saved = null;
+    try { saved = localStorage.getItem('bakugo_courier_theme'); } catch(e){}
+    const mode = saved || autoThemeByTime();
+    document.addEventListener('DOMContentLoaded', function(){ window.setAppTheme(mode); });
+})();
+
+window.toast = function(message){
+    var container = document.getElementById('toastContainer');
+    if(!container){ console.warn('Toast:', message); return; }
+    var el = document.createElement('div');
+    var text = String(message);
+    var isError = /xəta|Xəta|deyil|edin!|Login olun|dəstəklənmir/i.test(text);
+    var isSuccess = /✅|🏁|💳|yadda saxlanıldı|göndərildi|çatdırıldı/i.test(text);
+    el.className = 'toast' + (isError ? ' toast-error' : (isSuccess ? ' toast-success' : ''));
+    el.textContent = text;
+    container.appendChild(el);
+    setTimeout(function(){ el.remove(); }, 3600);
+};
+setTimeout(function(){
+    var splash = document.getElementById('splash');
+    var authEl = document.getElementById('auth');
+    if (splash && splash.style.display !== 'none') {
+        console.warn('Splash ehtiyat vaxtı bitdi — məcburi bağlanır (şəbəkə/CDN gecikməsi ola bilər).');
+        splash.style.display = 'none';
+        if (authEl && authEl.style.display !== 'flex') { authEl.style.display = 'flex'; }
+    }
+}, 4000);
+</script>
+
+<div id="orderAlert" style="display:none; position:fixed; top:70px; width:100%; text-align:center; z-index:9999; color:red; font-weight:bold; font-size:20px; text-shadow:0 0 5px white;">
+    🔔 YENİ SİFARİŞ GƏLİR!
+</div>
+
+<div id="loginModal">
+    <div class="login-card">
+        <h2 style="color:#d4af37; margin-bottom:20px;">BAKUGO GİRİŞ</h2>
+        <input id="loginEmail" type="email" placeholder="Email">
+        <input id="loginPass" type="password" placeholder="Şifrə">
+        <div class="premiumBtn" onclick="performLogin()">GİRİŞ ET</div>
+        <div style="margin-top:10px; cursor:pointer; color:#f3e2ab; font-size:12px;" onclick="resetPassword()">Şifrəni unutdum?</div>
+        <div class="close" onclick="closeLogin()">Bağla</div>
+    </div>
+</div>
+
+<div id="firstProfileModal" style="position:fixed;top:0;left:0;width:100%;height:100%;background:radial-gradient(ellipse at top, rgba(212,175,55,0.10) 0%, rgba(0,0,0,0.97) 55%);display:none;flex-direction:column;justify-content:center;align-items:center;z-index:10000;padding:20px;">
+    <div style="width:100%;max-width:400px;background:linear-gradient(135deg, rgba(212,175,55,0.16), rgba(0,0,0,0.5) 60%), linear-gradient(160deg,#141414,#050505);border:1px solid rgba(212,175,55,0.55);border-radius:26px;padding:32px 24px;text-align:center;box-shadow:0 0 60px rgba(212,175,55,0.28), inset 0 0 30px rgba(212,175,55,0.08);">
+        <div style="width:74px;height:74px;border-radius:50%;margin:0 auto 14px;background:linear-gradient(135deg,#fff3c4,#d4af37);display:flex;align-items:center;justify-content:center;font-size:34px;box-shadow:0 0 25px rgba(212,175,55,0.6);">🛵</div>
+        <div class="vip-badge">👑 BAKUGO KURYERİ</div>
+        <h2 style="margin-top:14px;font-size:21px;color:#fff;">Profilini tamamla</h2>
+        <div style="margin-top:6px;font-size:13px;color:#c9b25a;line-height:1.5;">İlk dəfə daxil olursan — davam etmək üçün məlumatlarını daxil et. Bu məlumatlar <b>giriş etdiyin hesaba</b> avtomatik yadda saxlanılacaq və bir daha soruşulmayacaq.</div>
+        <div id="firstProfileAccountTag" style="margin-top:10px;font-size:12px;color:rgba(255,255,255,0.45);"></div>
+        <input id="firstNameInput" class="premium-card-input" placeholder="Ad" style="margin-top:20px;">
+        <input id="firstSurnameInput" class="premium-card-input" placeholder="Soyad">
+        <input id="firstPhoneInput" class="premium-card-input" type="tel" placeholder="Mobil nömrə">
+        <div class="premiumBtn" style="background:linear-gradient(90deg,#0a84ff,#4fc3ff,#d4af37,#0a84ff);background-size:300% 300%;color:#04140d;box-shadow:0 0 25px rgba(10,132,255,0.45);" onclick="confirmFirstProfile()">✅ TƏSDİQLƏ VƏ DAVAM ET</div>
+    </div>
+</div>
+
+<div id="auth">
+<div class="logo" style="position:static;transform:none;margin-bottom:10px;font-size:34px;letter-spacing:3px;background:linear-gradient(135deg,#fff3c4,#d4af37,#fff3c4);-webkit-background-clip:text;background-clip:text;color:transparent;text-shadow:0 0 30px rgba(212,175,55,0.5);">BAKUGO</div>
+<div style="color:rgba(255,255,255,0.55);font-size:13px;margin-bottom:10px;letter-spacing:1px;">KURYER PLATFORMASI</div>
+<div class="btn" onclick="register()">📝 Qeydiyyat</div>
+<div class="btn" onclick="openLogin()">🔐 Giriş</div>
+</div>
+
+<div class="app">
+<div class="toast-container" id="toastContainer"></div>
+
+<div id="appParticles" class="app-particles"></div>
+
+<div class="logo" style="display:flex;align-items:center;justify-content:center;gap:8px;">
+<span class="logo-bolt">⚡</span>
+<span>BAKUGO</span>
+</div>
+
+<div class="header">
+<div class="icon" onclick="openAcc()">👤</div>
+
+<div style="display:flex;gap:10px;">
+<div class="icon" id="hotspotIcon" onclick="toggleHotspots()" title="Populyar Yerlər">
+<div class="wave-icon"><span class="wave-dot"></span><span class="wave-ring wave-ring1"></span><span class="wave-ring wave-ring2"></span></div>
+</div>
+
+<div class="icon" onclick="openNotifications()" style="position:relative;">
+🔔
+<span id="notifyBadge" style="display:none;position:absolute;top:-2px;right:-2px;background:#ff3d00;color:#fff;font-size:10px;font-weight:800;min-width:16px;height:16px;border-radius:50%;display:flex;align-items:center;justify-content:center;padding:0 4px;">0</span>
+</div>
+</div>
+
+</div>
+    
+<div class="map">
+
+<div id="map"></div>
+<div class="map-vignette"></div>
+
+<div id="wazeMapBtn" onclick="openWazeNav()" style="display:none;">
+🧭
+</div>
+
+<div id="gpsInfo">
+GPS AKTİV
+</div>
+
+</div>
+
+<div class="status-text" id="statusText">Sifarişlər gözlənilir...</div>
+
+<div class="switch" onclick="toggleStatus()">
+<div class="slider" id="slider">OFFLINE</div>
+</div>
+
+<div id="onlinePanel">
+<div class="welcomeText">Salam  👋<br>sizə bol qazanc arzu edirik 💸</div>
+<div class="big-card" onclick="openOrders()">📦 Sifarişlər</div>
+<div class="big-card" onclick="openNav()">🧭 Naviqasiya</div>
+</div>
+
+<div id="account">
+
+<div class="account-hero">
+    <div class="account-avatar">🛵</div>
+    <div class="account-name" id="accountHeroName">BakuGo Kuryeri</div>
+    <div class="account-email" id="accountHeroEmail">---</div>
+</div>
+
+<div class="btn" onclick="openModal('infoModal')"><span class="btn-icon">👤</span><span class="btn-label">Məlumatlarım</span><span class="btn-chevron">›</span></div>
+<div class="btn" onclick="openOrders()"><span class="btn-icon blue">📦</span><span class="btn-label">Sifarişlər</span><span class="btn-chevron">›</span></div>
+<div class="btn" onclick="openModal('earnModal')"><span class="btn-icon">💰</span><span class="btn-label">Qazanc</span><span class="btn-chevron">›</span></div>
+<div class="btn" onclick="openNav()"><span class="btn-icon blue">🧭</span><span class="btn-label">Naviqasiya</span><span class="btn-chevron">›</span></div>
+<div class="btn" onclick="securityResetPassword()"><span class="btn-icon">🔒</span><span class="btn-label">Təhlükəsizlik</span><span class="btn-chevron">›</span></div>
+<div class="btn" onclick="openReferral()"><span class="btn-icon blue">🎁</span><span class="btn-label">Dostu dəvət et</span><span class="btn-chevron">›</span></div>
+<div class="btn" onclick="openModal('faqModal')"><span class="btn-icon">❓</span><span class="btn-label">Tez-tez verilən suallar</span><span class="btn-chevron">›</span></div>
+<div class="btn" style="cursor:default;">
+    <span class="btn-icon">🔔</span>
+    <span class="btn-label">Sifariş səsi</span>
+    <div class="mini-toggle" id="soundToggle" onclick="toggleNotifSound()"><div class="mini-toggle-dot"></div></div>
+</div>
+<div class="btn" onclick="support()"><span class="btn-icon blue">💬</span><span class="btn-label">Dəstək</span><span class="btn-chevron">›</span></div>
+
+<div class="btn" onclick="openModal('privacyModal')"><span class="btn-icon">🔐</span><span class="btn-label">Gizlilik siyasəti</span><span class="btn-chevron">›</span></div>
+<div class="btn" onclick="openModal('termsModal')"><span class="btn-icon">📄</span><span class="btn-label">İstifadə şərtləri</span><span class="btn-chevron">›</span></div>
+<div class="btn" onclick="openModal('themeModal')"><span class="btn-icon">🎨</span><span class="btn-label">Tema</span><span class="btn-chevron">›</span></div>
+<div class="btn" onclick="openModal('aboutModal')"><span class="btn-icon">ℹ️</span><span class="btn-label">Tətbiq haqqında</span><span class="btn-chevron">›</span></div>
+
+<div class="btn" onclick="logout()" style="border: 1px solid #ff4444; color: #ff4444;">
+    <span class="btn-icon danger">🚪</span><span class="btn-label">Hesabdan çıxış</span><span class="btn-chevron">›</span>
+</div>
+
+<div class="btn" onclick="openModal('deleteAccountModal')" style="border: 1px solid #ff4444; color: #ff4444; opacity:0.9;">
+    <span class="btn-icon danger">🗑️</span><span class="btn-label">Hesabı sil</span><span class="btn-chevron">›</span>
+</div>
+
+<div class="close" onclick="closeAcc()">Bağla</div>
+</div>
+
+<div id="infoModal" class="modal">
+<div style="background:linear-gradient(135deg, rgba(212,175,55,0.18), rgba(0,0,0,0.4) 60%), linear-gradient(160deg,#141414,#050505); border:1px solid rgba(212,175,55,0.55); border-radius:26px; padding:28px 22px; text-align:center; box-shadow:0 0 40px rgba(212,175,55,0.25), inset 0 0 30px rgba(212,175,55,0.08); margin-bottom:20px;">
+    <div style="width:70px;height:70px;border-radius:50%;margin:0 auto 12px;background:linear-gradient(135deg,#fff3c4,#d4af37);display:flex;align-items:center;justify-content:center;font-size:32px;box-shadow:0 0 20px rgba(212,175,55,0.6);">🛵</div>
+    <div class="vip-badge">👑 BAKUGO KURYERİ</div>
+    <div id="infoFullName" style="margin-top:14px;font-size:20px;font-weight:800;color:#fff;">---</div>
+    <div id="infoPhoneDisplay" style="margin-top:4px;font-size:13px;color:#c9b25a;">---</div>
+    <div id="infoEmailDisplay" style="margin-top:4px;font-size:12.5px;color:#8fbfe8;opacity:0.9;">---</div>
+</div>
+
+<input id="nameInput" class="premium-card-input" placeholder="Ad">
+<input id="surnameInput" class="premium-card-input" placeholder="Soyad">
+<input id="phoneInput" class="premium-card-input" placeholder="Mobil nömrə">
+    <div class="btn" onclick="saveUser()" style="border:1px solid rgba(212,175,55,0.5); color:#d4af37; justify-content:center; font-weight:700;">💾 Yadda saxla</div>
+<div class="close" onclick="closeModal('infoModal')">Bağla</div>
+</div>
+
+<div id="ordersModal" class="modal">
+    <div class="order-lux">
+
+        <div class="ol-kicker">Yeni Sifariş</div>
+        <div id="orderCountdown" class="ol-countdown">60</div>
+        <div id="orderIdDisplay" class="ol-id">#---</div>
+
+        <div class="ol-price-wrap">
+            <div id="price" class="ol-price">0.00 AZN</div>
+        </div>
+
+        <div class="ol-tabs">
+            <div id="tabActiveOrder" class="ol-tab ol-tab-active" onclick="showOrderTab('active')">🟢 Aktiv Sifariş</div>
+            <div id="tabDeliveredOrders" class="ol-tab" onclick="showOrderTab('delivered')">✅ Çatdırılmış Sifarişlər</div>
+        </div>
+
+        <div id="prevOrdersSection" style="display:none;">
+            <div id="prevOrdersList" style="display:flex; flex-direction:column; gap:10px; margin:14px 0;"></div>
+        </div>
+
+        <div id="currentOrderSection" class="ol-section">
+
+            <div class="ol-card">
+                <div class="ol-badge">📍</div>
+                <div class="ol-card-body">
+                    <div class="ol-card-label">Restoran</div>
+                    <div id="restaurantName" class="ol-card-title">---</div>
+                    <div id="restaurantAddress" class="ol-card-sub">---</div>
+                    <div id="restaurantPhone" class="ol-card-phone" onclick="callRestaurant()">📞 ---</div>
+                </div>
+            </div>
+
+            <div class="ol-card">
+                <div class="ol-badge">👤</div>
+                <div class="ol-card-body">
+                    <div class="ol-card-label">Müştəri</div>
+                    <div id="customerName" class="ol-card-title">---</div>
+                    <div id="customerAddress" class="ol-card-sub">---</div>
+                    <div id="customerPhone" class="ol-card-phone" onclick="callCustomer()">📞 ---</div>
+                </div>
+            </div>
+
+            <div class="ol-card ol-items">
+                <div class="ol-badge">📋</div>
+                <div class="ol-card-body">
+                    <div class="ol-card-label">Sifarişin Tərkibi</div>
+                    <ul id="prodList"></ul>
+                    <div class="ol-note">✏️ Qeyd: <span id="prodNote">Yoxdur</span></div>
+                </div>
+            </div>
+
+            <div id="routeInfoStrip" class="ol-route-info">
+                <div class="ol-route-chip">
+                    <div class="ol-route-icon">🛣️</div>
+                    <div class="ol-route-data">
+                        <div id="distance" class="ol-route-value">-- KM</div>
+                        <div class="ol-route-label">Real Məsafə</div>
+                    </div>
+                </div>
+                <div class="ol-route-chip">
+                    <div class="ol-route-icon">⏱️</div>
+                    <div class="ol-route-data">
+                        <div id="etaTime" class="ol-route-value">-- dəq</div>
+                        <div class="ol-route-label">Təxmini Vaxt</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="rejectBtn" class="ol-reject" onclick="rejectOrder()">❌ İmtina et</div>
+
+        <div id="acceptBtnBox" class="swipe-container">
+            <div id="thumb" class="swipe-thumb">GO</div>
+            <div class="swipe-text">SÜRÜŞDÜR VƏ QƏBUL ET</div>
+        </div>
+
+        <div id="collectBtnBox" style="display: none;">
+            <div class="premiumBtn" onclick="collectOrderAction()">🛍️ TƏHVİL ALDIM</div>
+        </div>
+
+        <div id="deliverBtnBox" style="display: none;">
+            <div class="premiumBtn" onclick="deliverOrderAction()">🏁 ÇATDIRDIM</div>
+        </div>
+
+        <div id="orderCloseBtn" class="ol-close" onclick="closeOrderModal()">Bağla</div>
+    </div>
+</div>
+
+<div id="navModal" class="modal">
+<h3 style="color:#d4af37;letter-spacing:0.5px;">🧭 Naviqasiya</h3>
+<p style="opacity:0.55;font-size:12.5px;margin-top:4px;line-height:1.5;">Seçdiyin provayder tətbiqdəki xəritənin görünüşünü dəyişir və aktiv sifariş zamanı marşrut həmin provayderlə açılır.</p>
+
+<div class="nav-provider-card" id="navCard-google" onclick="setMap('google')">
+    <div class="btn-icon blue">🗺</div>
+    <div style="flex:1;">
+        <div class="nav-provider-title">Google Maps</div>
+        <div class="nav-provider-sub">Google xəritəsi + Google Maps ilə marşrut</div>
+    </div>
+    <div class="nav-check">✓</div>
+</div>
+
+<div class="nav-provider-card" id="navCard-waze" onclick="setMap('waze')">
+    <div class="btn-icon">🧭</div>
+    <div style="flex:1;">
+        <div class="nav-provider-title">Waze</div>
+        <div class="nav-provider-sub">Google xəritəsi + Waze ilə marşrut</div>
+    </div>
+    <div class="nav-check">✓</div>
+</div>
+
+<div class="nav-provider-card" id="navCard-yandex" onclick="setMap('yandex')">
+    <div class="btn-icon danger">📍</div>
+    <div style="flex:1;">
+        <div class="nav-provider-title">Yandex</div>
+        <div class="nav-provider-sub">Google peyk görünüşü + Yandex ilə marşrut</div>
+    </div>
+    <div class="nav-check">✓</div>
+</div>
+
+<div class="close" onclick="closeModal('navModal')">Bağla</div>
+</div>
+
+<div id="privacyModal" class="modal" style="text-align:left;">
+<h3>🔐 Gizlilik Siyasəti</h3>
+<p style="opacity:0.6;font-size:12px;">Son yenilənmə: 08.11.2026</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">1. Ümumi müddəalar</h4>
+<p>BakuGo ("Tətbiq", "biz") kuryerlik xidməti göstərən istifadəçilərin ("Kuryer", "siz") şəxsi məlumatlarının qorunmasına önəm verir. Bu sənəd hansı məlumatların toplandığını, necə istifadə olunduğunu və hüquqlarınızı izah edir. Tətbiqdən istifadə etməklə bu siyasətlə razılaşmış olursunuz.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">2. Topladığımız məlumatlar</h4>
+<p><b>Qeydiyyat məlumatları:</b> ad, soyad, telefon nömrəsi, e-poçt ünvanı.<br>
+<b>Lokasiya məlumatları:</b> GPS koordinatları — sifarişin qəbulu, marşrutun qurulması və çatdırılmanın izlənməsi üçün, tətbiq aktiv istifadə olunduğu müddətdə.<br>
+<b>Sifariş məlumatları:</b> çatdırılma tarixçəsi, məsafə, qazanc, status.<br>
+<b>Maliyyə istinad məlumatı:</b> ödəniş kartının yalnız son 4 rəqəmi və sahibinin adı (tam kart nömrəsi, bitmə tarixi və CVV heç vaxt saxlanılmır). Balans çıxarma sorğularında göstərdiyiniz bank kartı/IBAN nömrəsi yalnız köçürmənin həyata keçirilməsi üçün istifadə olunur.<br>
+<b>Texniki məlumatlar:</b> cihaz növü, əməliyyat sistemi, tətbiq versiyası, bildiriş göndərmək üçün cihaz identifikatoru.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">3. Məlumatlardan istifadə məqsədi</h4>
+<p>Məlumatlar yalnız aşağıdakı məqsədlər üçün istifadə olunur: sifarişlərin təyin edilməsi və izlənməsi, ödəniş və balans hesablamaları, dəstək xidməti göstərilməsi, tətbiqin təhlükəsizliyinin təmin edilməsi və qanuni tələblərə cavab verilməsi. Məlumatlarınız satılmır və ya reklam məqsədilə üçüncü tərəflərə ötürülmür.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">4. Məlumatların paylaşılması</h4>
+<p>Məlumatlarınız yalnız xidmətin işləməsi üçün zəruri olan aşağıdakı tərəflərlə paylaşılır: Google Firebase (məlumatların təhlükəsiz saxlanması və autentifikasiya), xəritə və naviqasiya xidmətləri (Google Maps, Waze, Yandex — yalnız xəritəni göstərmək və marşrut qurmaq üçün, sizin adınız ötürülmür), lisenziyalı ödəniş provayderləri (real pul köçürmələri həyata keçirildikdə) və qanunla tələb olunduğu halda müvafiq dövlət qurumları.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">5. Lokasiya icazəsi</h4>
+<p>GPS lokasiyası yalnız siz ONLINE rejimdə olduğunuz və tətbiq açıq (ön planda) olduğu müddətdə toplanır, arxa fonda toplanmır. Lokasiya restoran/müştəriyə marşrut göstərmək və aktiv sifarişin müştəri tərəfindən canlı izlənməsi üçün istifadə edilir. Lokasiya icazəsini istənilən vaxt telefonunuzun tənzimləmələrindən ləğv edə bilərsiniz, bu halda naviqasiya funksiyaları məhdudlaşacaq.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">6. Saxlanma müddəti</h4>
+<p>Hesab və sifariş məlumatları hesabınız aktiv olduğu müddətdə saxlanılır. Hesabın silinməsi tələb olunduqda, qanuni saxlama öhdəlikləri (məs. maliyyə hesabatlığı) istisna olmaqla, məlumatlar 30 gün ərzində silinir.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">7. Təhlükəsizlik</h4>
+<p>Məlumatlarınız şifrələnmiş bağlantılar (HTTPS) və giriş nəzarətli baza (Firebase Security Rules) vasitəsilə qorunur. Ödəniş kartı məlumatları PCI-DSS standartlarına uyğun olaraq tam formada heç vaxt saxlanılmır.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">8. Hüquqlarınız</h4>
+<p>İstənilən vaxt aşağıdakı hüquqlardan istifadə edə bilərsiniz: məlumatlarınıza giriş tələb etmək, onları düzəltmək, hesabınızı və məlumatlarınızı silmək. Hesabı tətbiqdə Hesab → "Hesabı sil" bölməsindən dərhal silə və ya <a href="delete-account.html" style="color:#4fc3ff;">hesabın silinməsi səhifəsindən</a> sorğu göndərə bilərsiniz. Siyasətin veb versiyası: <a href="privacy-policy.html" style="color:#4fc3ff;">privacy-policy.html</a>.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">9. Yaş məhdudiyyəti</h4>
+<p>Tətbiq 18 yaşdan yuxarı şəxslər üçün nəzərdə tutulub. Bilərəkdən yetkinlik yaşına çatmayan şəxslərdən məlumat toplamırıq.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">10. Dəyişikliklər</h4>
+<p>Bu siyasət zaman-zaman yenilənə bilər. Əhəmiyyətli dəyişikliklər barədə tətbiq daxilində bildiriş veriləcək.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">11. Əlaqə</h4>
+<p>Suallarınız üçün: WhatsApp dəstək xətti — <a href="https://wa.me/994702484852" style="color:#4fc3ff;">+994 70 248 48 52</a>, e-poçt: <a href="mailto:seymur048ibrahimov@gmail.com" style="color:#4fc3ff;">seymur048ibrahimov@gmail.com</a></p>
+
+<div class="close" onclick="closeModal('privacyModal')">Bağla</div>
+</div>
+
+<div id="termsModal" class="modal" style="text-align:left;">
+<h3>📄 İstifadə Şərtləri</h3>
+<p style="opacity:0.6;font-size:12px;">Son yenilənmə: 08.08.2026</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">1. Qəbul</h4>
+<p>BakuGo tətbiqindən istifadə etməklə bu şərtləri tam qəbul etmiş sayılırsınız. Şərtlərlə razı deyilsinizsə, tətbiqdən istifadə etməyin.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">2. Xidmətin təsviri</h4>
+<p>BakuGo müstəqil kuryerləri restoranlar/mağazalar və müştərilər arasında çatdırılma sifarişləri ilə əlaqələndirən platformadır. Biz sifarişlərin təyin edilməsi, marşrutlaşdırma və ödəniş hesablanması üçün texniki infrastruktur təqdim edirik.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">3. Qeydiyyat və hesab</h4>
+<p>Qeydiyyat zamanı düzgün və dolğun məlumat verməyisiniz. Hesabınızın təhlükəsizliyinə (şifrənin gizli saxlanmasına) görə özünüz məsuliyyət daşıyırsınız. 18 yaşdan aşağı şəxslər qeydiyyatdan keçə bilməz.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">4. Kuryerin statusu və öhdəlikləri</h4>
+<p>Kuryer BakuGo-nun işçisi deyil, müstəqil podratçı statusunda fəaliyyət göstərir. Sifarişləri vaxtında, ehtiyatla və qanunla müəyyən edilmiş yol hərəkəti qaydalarına uyğun çatdırmaq kuryerin öhdəliyidir. Nəqliyyat vasitəsinin sığortası və qanuni idarəetmə hüququ kuryerin öz məsuliyyətindədir.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">5. Ödəniş və komissiya</h4>
+<p>Hər çatdırılan sifariş üçün qazanc tətbiqdə göstərilən tarifə əsasən hesablanır və kuryerin balansına əlavə olunur. Balansın çıxarılması tələbi göndərildikdə, ödəniş göstərilən bank hesabı/kart məlumatına uyğun olaraq admin təsdiqindən sonra 3 iş günü ərzində həyata keçirilir. Yanlış hesab məlumatı verilməsindən yaranan gecikmələrə görə platforma məsuliyyət daşımır.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">6. Məsuliyyətin məhdudlaşdırılması</h4>
+<p>BakuGo texniki nasazlıqlar, internet kəsilmələri və ya üçüncü tərəf xidmətlərinin (naviqasiya, ödəniş provayderi) fasilələrindən yaranan gecikmələrə görə məsuliyyət daşımır. Platforma xidməti "olduğu kimi" təqdim edir.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">7. Qadağan olunan davranış</h4>
+<p>Saxta sifariş yaratmaq, başqasının hesabından istifadə etmək, tətbiqin təhlükəsizlik sistemini pozmağa cəhd etmək və digər istifadəçilərə qarşı təhqiredici davranış qadağandır. Bu qaydaların pozulması hesabın dərhal bağlanmasına səbəb ola bilər.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">8. Hesabın dayandırılması və ləğvi</h4>
+<p>Qaydaların pozulması halında hesabınız xəbərdarlıq edilmədən dayandırıla bilər. Hesabınızı istənilən vaxt tətbiqdə Hesab → "Hesabı sil" bölməsindən və ya <a href="delete-account.html" style="color:#4fc3ff;">hesabın silinməsi səhifəsi</a> vasitəsilə silə bilərsiniz.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">9. Mübahisələrin həlli</h4>
+<p>Tərəflər arasında yaranan mübahisələr ilk növbədə danışıqlar yolu ilə, mümkün olmadıqda isə Azərbaycan Respublikasının qanunvericiliyinə uyğun məhkəmə qaydasında həll edilir.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">10. Şərtlərə dəyişikliklər</h4>
+<p>Bu şərtlər zaman-zaman yenilənə bilər. Yeniləndikdən sonra tətbiqdən istifadəni davam etdirməyiniz yeni şərtləri qəbul etdiyiniz anlamına gəlir.</p>
+
+<h4 style="color:#d4af37;margin-top:16px;">11. Əlaqə</h4>
+<p>Suallarınız üçün: WhatsApp dəstək xətti — <a href="https://wa.me/994702484852" style="color:#4fc3ff;">+994 70 248 48 52</a></p>
+
+<div class="close" onclick="closeModal('termsModal')">Bağla</div>
+</div>
+
+<div id="deleteAccountModal" class="modal" style="text-align:left;">
+<h3 style="color:#ff4444;">🗑️ Hesabı sil</h3>
+<p style="margin-top:14px;">Bu əməliyyat <b>geri qaytarıla bilməz</b>. Hesabınız silindikdən sonra:</p>
+<p>• Profil məlumatlarınız (ad, telefon, e-poçt) bazadan silinəcək<br>
+• Saxlanılmış kart məlumatı (son 4 rəqəm) silinəcək<br>
+• Balansınız və hesab girişiniz artıq bərpa oluna bilməyəcək<br>
+• Tamamlanmış sifariş tarixçəniz qanuni saxlama tələbləri üçün anonimləşdirilmiş şəkildə saxlanıla bilər</p>
+<p style="margin-top:14px;opacity:0.8;">Davam etmək üçün şifrənizi təsdiq edin:</p>
+<input id="deleteAccountPassword" type="password" placeholder="Cari şifrəniz" style="margin-top:10px;">
+<div class="premiumBtn" style="background:linear-gradient(90deg,#ff4444,#ff8080);color:#2a0000;margin-top:16px;" onclick="confirmDeleteAccount()">Hesabı həmişəlik sil</div>
+<div class="close" onclick="closeModal('deleteAccountModal')">Ləğv et</div>
+</div>
+
+
+<div id="earnModal" class="modal">
+
+<div class="vip-hero">
+<div class="vip-badge">👑 VIP QIZIL SÜRÜCÜ</div>
+<div class="vip-balance-label">Cari Balans</div>
+<div class="vip-balance-value" id="vipBalanceValue">0.00 <span style="font-size:20px;">AZN</span></div>
+<div style="margin-top:8px;font-size:12.5px;color:#8fbfe8;opacity:0.9;">💼 Toplam Balans: <span id="vipTotalEarned">0.00</span> AZN</div>
+<div class="vip-sub">Bu gün qazandığın hər manat sənə daha yaxın olur 💫</div>
+</div>
+
+<div class="vip-action-row">
+<div class="vip-action-btn" onclick="openCourierWithdraw()">💸 Pul çıxar</div>
+<div class="vip-action-btn outline" onclick="openModal('cardModal')">➕ Kart əlavə et</div>
+</div>
+
+<div class="vip-perk"><div class="ico">⚡</div><div>Pik saatlarda qazanc dərəcən <b>avtomatik artır</b></div></div>
+<div class="vip-perk"><div class="ico">🏆</div><div>PLATİN səviyyəyə çatanda komissiya <b>0%</b> olur</div></div>
+
+<h4 style="color:#d4af37;margin-top:20px;margin-bottom:8px;font-size:14px;letter-spacing:1px;">📦 QAZANC TARİXÇƏSİ</h4>
+<div id="earnOrdersHistory" style="text-align:left;"></div>
+
+<div id="courierWithdrawHistory" style="margin-top:14px;text-align:left;"></div>
+
+<div class="close" onclick="closeModal('earnModal')">Bağla</div>
+</div>
+
+<div id="courierWithdrawModal" class="modal">
+<h3>💸 Pul Çıxar</h3>
+<div class="balanceBox" style="margin:10px 0;">Mövcud balans: <span id="courierWithdrawBalance">0.00 AZN</span></div>
+<input id="courierWithdrawAmount" type="number" placeholder="Çıxarmaq istədiyiniz məbləğ (AZN)" style="width:100%;margin-bottom:10px;">
+<input id="courierWithdrawCard" placeholder="Kart nömrəsi / IBAN" style="width:100%;margin-bottom:10px;">
+<div class="premiumBtn" onclick="submitCourierWithdraw()">Sorğunu göndər</div>
+<div class="close" onclick="closeModal('courierWithdrawModal')">Bağla</div>
+</div>
+
+<div id="cardModal" class="modal premium-card">
+<div class="live-border"></div>
+<div class="card3d" id="card3d">
+<div class="card-face front">
+<div class="card-top">
+<div class="bank" id="bankName">BAKUGO</div>
+<div class="visaLogo" id="cardType">💳</div>
+</div>
+<div class="chip"></div>
+<div class="card-number" id="cardPreview">**** **** **** 0000</div>
+<div class="card-bottom">
+<div><span>Kart sahibi</span><h4 id="namePreview">AD SOYAD</h4></div>
+<div><span>Məqsəd</span><h4>Qazanc ödənişi</h4></div>
+</div>
+</div>
+<div class="card-face back">
+<div class="blackLine"></div>
+<div class="cvvBox" style="text-align:center;">Yalnız son 4 rəqəm saxlanılır</div>
+</div>
+</div>
+<input id="cardNumber" maxlength="19" placeholder="Kart nömrəsi">
+<input id="cardName" placeholder="Ad Soyad">
+<p style="font-size:12px;opacity:0.6;margin-top:10px;line-height:1.5;">Kart yalnız qazancınızın sizə köçürülməsi üçün istifadə olunur. Bitmə tarixi və CVV kodu heç vaxt soruşulmur və saxlanılmır.</p>
+<div class="premiumBtn" onclick="confirmCard()">💳 Təsdiqlə</div>
+<div class="balanceBox">💰 Balans:<span id="balance">0.00</span> AZN</div>
+<div class="close" onclick="closeModal('cardModal')">Bağla</div>
+</div>
+
+<div id="notifyModal" class="modal">
+<div id="notifPermBox" style="display:none;margin-bottom:14px;padding:14px;border-radius:16px;border:1px solid rgba(212,175,55,0.45);background:linear-gradient(160deg,#1a1508,#0a0a0a);">
+  <div style="font-size:13px;line-height:1.5;opacity:0.85;">Yeni sifariş və admin mesajlarını telefonun bildiriş panelində görmək üçün icazə verin.</div>
+  <div class="premiumBtn" style="margin-top:10px;" onclick="window.initPush && window.initPush(true)">🔔 Telefon bildirişlərini aç</div>
+</div>
+<h3 style="color:#d4af37; margin-bottom:15px;">🔔 Bildirişlər</h3>
+<div id="notifyList"><div id="fbNotifyContainer"><p style="opacity:.6;text-align:center;font-size:13px;">Bildiriş yoxdur</p></div></div>
+<div class="close" onclick="closeModal('notifyModal')">Bağla</div>
+</div>
+
+<div id="themeModal" class="modal">
+<h3 style="color:#d4af37; margin-bottom:15px;">🎨 Tema</h3>
+<div class="btn" id="themeLightBtn" onclick="setAppTheme('light')" style="display:flex;align-items:center;justify-content:space-between;">
+  <span>☀️ Açıq rejim</span><span id="themeLightCheck" style="opacity:0;">✓</span>
+</div>
+<div class="btn" id="themeDarkBtn" onclick="setAppTheme('dark')" style="display:flex;align-items:center;justify-content:space-between;">
+  <span>🌙 Qara rejim</span><span id="themeDarkCheck" style="opacity:0;">✓</span>
+</div>
+<div class="close" onclick="closeModal('themeModal')">Bağla</div>
+</div>
+
+<div id="referralModal" class="modal">
+<h3 style="color:#d4af37;">🎁 Dostu Dəvət Et</h3>
+<p style="opacity:0.6;font-size:12.5px;margin-top:6px;line-height:1.55;">Dostunu BakuGo Kuryerinə dəvət et — o, ilk 10 çatdırılmanı tamamlayanda hər ikiniz bonus qazanırsınız!</p>
+
+<div style="background:linear-gradient(160deg,#141414,#0c0c0c);border:1px solid rgba(212,175,55,0.3);border-radius:16px;padding:22px;margin-top:16px;text-align:center;">
+    <div style="font-size:11px;opacity:0.5;letter-spacing:1px;">SƏNİN DƏVƏT KODUN</div>
+    <div id="referralCodeText" style="font-size:26px;font-weight:800;color:#d4af37;letter-spacing:2px;margin-top:8px;">---</div>
+</div>
+
+<div style="display:flex;gap:10px;margin-top:16px;">
+    <div class="btn" style="flex:1;justify-content:center;margin:0;" onclick="copyReferralCode()">📋 Kopyala</div>
+    <div class="btn" style="flex:1;justify-content:center;margin:0;" onclick="shareReferralCode()">📤 Paylaş</div>
+</div>
+
+<div style="margin-top:18px;display:flex;justify-content:space-between;align-items:center;background:rgba(212,175,55,0.06);border-radius:12px;padding:14px 16px;">
+    <span style="font-size:12.5px;opacity:0.7;">Dəvət etdiyin dostlar</span>
+    <span id="referralCountText" style="font-weight:800;color:#d4af37;">0</span>
+</div>
+
+<div class="close" onclick="closeModal('referralModal')">Bağla</div>
+</div>
+
+<div id="faqModal" class="modal">
+<h3 style="color:#d4af37; margin-bottom:14px;">❓ Tez-tez Verilən Suallar</h3>
+
+<div class="faq-item" onclick="this.classList.toggle('open')">
+  <div class="faq-q"><span>Necə onlayn ola bilərəm?</span><span class="faq-arrow">▾</span></div>
+  <div class="faq-a">Əsas ekranın aşağısındakı slayderi sağa çəkərək ONLINE rejiminə keçə bilərsən. Yalnız onlayn olanda sənə yeni sifarişlər göndərilir.</div>
+</div>
+
+<div class="faq-item" onclick="this.classList.toggle('open')">
+  <div class="faq-q"><span>Qazancımı necə çıxara bilərəm?</span><span class="faq-arrow">▾</span></div>
+  <div class="faq-a">Hesab → Qazanc bölməsindən "Pul çıxar" düyməsinə klikləyib kart məlumatlarını daxil et. Sorğu admin tərəfindən təsdiqlənəndən sonra balansına köçürülür.</div>
+</div>
+
+<div class="faq-item" onclick="this.classList.toggle('open')">
+  <div class="faq-q"><span>Sifarişi rədd etsəm nə olar?</span><span class="faq-arrow">▾</span></div>
+  <div class="faq-a">Sifariş avtomatik olaraq başqa kuryerə göndərilir. Tez-tez rədd etmək reytinqinə mənfi təsir edə bilər.</div>
+</div>
+
+<div class="faq-item" onclick="this.classList.toggle('open')">
+  <div class="faq-q"><span>Naviqasiya provayderini necə dəyişirəm?</span><span class="faq-arrow">▾</span></div>
+  <div class="faq-a">Hesab → Naviqasiya bölməsindən Google Maps, Waze və ya Yandex arasından seçim edə bilərsən. Seçim həm tətbiqdəki xəritənin görünüşünü, həm də sifariş marşrutunu dəyişir.</div>
+</div>
+
+<div class="faq-item" onclick="this.classList.toggle('open')">
+  <div class="faq-q"><span>Şifrəmi necə dəyişə bilərəm?</span><span class="faq-arrow">▾</span></div>
+  <div class="faq-a">Hesab → Təhlükəsizlik bölməsinə daxil ol. Email ünvanına şifrə yeniləmə linki göndəriləcək.</div>
+</div>
+
+<div class="faq-item" onclick="this.classList.toggle('open')">
+  <div class="faq-q"><span>Dostumu necə dəvət edə bilərəm?</span><span class="faq-arrow">▾</span></div>
+  <div class="faq-a">Hesab → "Dostu dəvət et" bölməsindən şəxsi dəvət kodunu kopyala və ya birbaşa paylaş düyməsi ilə dostuna göndər.</div>
+</div>
+
+<div class="close" onclick="closeModal('faqModal')">Bağla</div>
+</div>
+
+<div id="aboutModal" class="modal">
+<div style="text-align:center;">
+  <div style="width:70px;height:70px;border-radius:22px;margin:0 auto 14px;background:linear-gradient(135deg,#fff3c4,#d4af37);display:flex;align-items:center;justify-content:center;font-size:34px;box-shadow:0 0 24px rgba(212,175,55,0.5);">🛵</div>
+  <h3 style="color:#d4af37;margin:0;">BakuGo Kuryer</h3>
+  <div style="opacity:0.55;font-size:12.5px;margin-top:6px;">Versiya <span id="appVersionText">1.0.0</span></div>
+</div>
+
+<div style="margin-top:20px;font-size:13px;line-height:1.7;opacity:0.75;">
+BakuGo — Azərbaycanda sürətli və etibarlı çatdırılma platformasıdır. Kuryer tətbiqi vasitəsilə sifarişləri qəbul edir, real vaxt rejimində marşrutunu izləyir və qazancını idarə edirsən.
+</div>
+
+<div style="margin-top:16px;display:flex;flex-direction:column;gap:8px;font-size:12.5px;opacity:0.6;">
+  <div style="display:flex;justify-content:space-between;"><span>Platforma</span><span>Firebase</span></div>
+  <div style="display:flex;justify-content:space-between;"><span>Xəritə mühərriki</span><span>Google Maps</span></div>
+  <div style="display:flex;justify-content:space-between;"><span>Son yenilənmə</span><span>08.11.2026</span></div>
+</div>
+
+<div style="margin-top:18px;font-size:11.5px;opacity:0.4;text-align:center;">© 2026 BakuGo. Bütün hüquqlar qorunur.</div>
+<div class="close" onclick="closeModal('aboutModal')">Bağla</div>
+</div>
+
+</div>
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-app.js";
+  import { getFirestore, collection, query, where, onSnapshot, doc, updateDoc, getDoc, setDoc, addDoc, deleteDoc, increment, limit, orderBy, runTransaction } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore.js";
+  import { getAuth, signInWithEmailAndPassword, sendPasswordResetEmail, onAuthStateChanged, signOut, deleteUser, reauthenticateWithCredential, EmailAuthProvider } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-auth.js";
+  import { getMessaging, getToken, onMessage, isSupported } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-messaging.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyBQIDfObXpxNa1hVAYDmigSi9u49y_BJQc",
+    authDomain: "bkaugo.firebaseapp.com",
+    projectId: "bkaugo",
+    storageBucket: "bkaugo.firebasestorage.app",
+    messagingSenderId: "568740538737",
+    appId: "1:568740538737:web:9b2ab40d0b728789a1aed0",
+    measurementId: "G-44T95W0PSX"
+  };
+
+  /* Ayrı ad: eyni telefonda müştəri və kuryer tətbiqi bir-birinin girişini pozmasın */
+  const app = initializeApp(firebaseConfig, "bakugo-kuryer");
+  const db = getFirestore(app);
+  const auth = getAuth(app);
+  
+  window.db = db;
+  window.auth = auth;
+  window.signInWithEmailAndPassword = signInWithEmailAndPassword;
+  window.sendPasswordResetEmail = sendPasswordResetEmail;
+  window.signOut = signOut;
+  window.deleteUser = deleteUser;
+  window.reauthenticateWithCredential = reauthenticateWithCredential;
+  window.EmailAuthProvider = EmailAuthProvider;
+  window.deleteDoc = deleteDoc;
+  window.setDoc = setDoc;
+  window.doc = doc;
+  window.getDoc = getDoc;
+  window.updateDoc = updateDoc;
+  window.increment = increment;
+  window.runTransaction = runTransaction;
+  window.collection = collection;
+  window.query = query;
+  window.where = where;
+  window.onSnapshot = onSnapshot;
+  window.limit = limit;
+
+  /* Real yol məsafəsi + vaxtı (əvvəl Google Directions, alınmasa OSRM). Şəbəkə zəif olsa belə HEÇ VAXT quş-baxışına (düz xətt) keçmir —
+     internet qayıdana/OSRM cavab verənə qədər səssizcə yenidən cəhd edir. onRetry(cəhdSayı) ilə UI-a
+     "yenidən cəhd olunur" statusu ötürülə bilər. */
+  window.getRealRouteInfo = async (lat1, lng1, lat2, lng2, onRetry) => {
+    const url = `https://router.project-osrm.org/route/v1/driving/${lng1},${lat1};${lng2},${lat2}?overview=false`;
+    let attempt = 0;
+    while (true) {
+        attempt++;
+        try {
+            if (window.__bakugoRoute && !window.__gmDirDisabled) {
+                try {
+                    const g = await window.__bakugoRoute({ lat: +lat1, lng: +lng1 }, { lat: +lat2, lng: +lng2 });
+                    if (g && g.meters >= 0) {
+                        return { km: parseFloat((g.meters / 1000).toFixed(1)), minutes: Math.max(1, Math.round(g.seconds / 60)) };
+                    }
+                } catch (ge) { /* aşağıda OSRM ilə davam edir */ }
+            }
+            if (!navigator.onLine) {
+                await new Promise((resolve) => {
+                    const handler = () => { window.removeEventListener('online', handler); resolve(); };
+                    window.addEventListener('online', handler);
+                });
+            }
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 10000);
+            const res = await fetch(url, { signal: controller.signal });
+            clearTimeout(timeoutId);
+            const data = await res.json();
+            if (data.code === 'Ok' && data.routes && data.routes[0]) {
+                const km = parseFloat((data.routes[0].distance / 1000).toFixed(1));
+                const minutes = Math.max(1, Math.round(data.routes[0].duration / 60));
+                return { km, minutes };
+            }
+            throw new Error('OSRM boş cavab verdi');
+        } catch (e) {
+            console.warn(`Real marşrut sorğusu uğursuz oldu (cəhd ${attempt}):`, e.message);
+            if (typeof onRetry === 'function') onRetry(attempt);
+            const delay = Math.min(1500 * attempt, 8000);
+            await new Promise((r) => setTimeout(r, delay));
+        }
+    }
+  };
+
+  /* Admin paneldəki "Kuryer komissiyası" bölməsindən (settings/courierPricing) gələn tarif.
+     Sənəd yoxdursa köhnə standart dəyərlər işləyir. */
+  window.__courierPricing = window.__courierPricing || null;
+  const __DEF_PRICING = { basePrice: 1.40, baseKm: 1.5, perKm: 0.45, peakPerKm: 0.50, rainBonus: 0.70, rainActive: false,
+    peakWindows: ['07:30-09:00','12:30-15:00','18:00-21:00','02:00-04:00'] };
+  const __pricing = () => Object.assign({}, __DEF_PRICING, window.__courierPricing || {});
+  const __toHours = (t) => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(t).trim()); return m ? (+m[1]) + (+m[2]) / 60 : NaN; };
+  window.isPeakHour = () => {
+    const now = new Date();
+    const time = now.getHours() + now.getMinutes() / 60;
+    const wins = __pricing().peakWindows || [];
+    return wins.some(w => {
+      const p = String(w).split('-'); if (p.length !== 2) return false;
+      const a = __toHours(p[0]), b = __toHours(p[1]);
+      if (isNaN(a) || isNaN(b)) return false;
+      return a <= b ? (time >= a && time <= b) : (time >= a || time <= b);
+    });
+  };
+  window.startCourierPricingListener = () => {
+    try {
+      if (window.__unsubPricing) return;
+      window.__unsubPricing = window.onSnapshot(window.doc(window.db, 'settings', 'courierPricing'), (snap) => {
+        window.__courierPricing = snap.exists() ? snap.data() : null;
+      }, (err) => { console.warn('courierPricing oxunmadı:', err && err.message); window.__unsubPricing = null; });
+    } catch (e) { console.warn(e); }
+  };
+
+  /* Pilləli (tiered) qiymət modeli — bütün rəqəmlər admin paneldən idarə olunur:
+     - baza qiymət ilk baseKm km-i əhatə edir
+     - baseKm-i keçən HƏR əlavə km (yuxarı yuvarlanır) pik saatda peakPerKm, adi vaxtda perKm əlavə edir
+     - yağışlı havada rainBonus bir dəfə sona əlavə olunur (sifarişdə isRainy və ya admində "yağışlı hava aktiv") */
+  window.calculateDynamicPrice = (km, isRainy = false) => {
+    const P = __pricing();
+    const rainy = !!isRainy || !!P.rainActive;
+    const ratePerKm = window.isPeakHour() ? (parseFloat(P.peakPerKm) || 0) : (parseFloat(P.perKm) || 0);
+    let price = parseFloat(P.basePrice) || 0;
+    const baseKm = parseFloat(P.baseKm) || 0;
+    if (km > baseKm) price += Math.ceil(km - baseKm) * ratePerKm;
+    if (rainy) price += parseFloat(P.rainBonus) || 0;
+    return price.toFixed(2);
+  };
+
+  window.checkAndNotifyPeakHours = () => {
+    if (!window.online) return;
+    const isPeak = window.isPeakHour();
+    const notifyList = document.getElementById('notifyList');
+    const existingBtn = document.getElementById('peakNotifyBtn');
+    
+    if (isPeak && !existingBtn) {
+        const div = document.createElement('div');
+        div.id = 'peakNotifyBtn';
+        div.className = 'btn';
+        div.style.border = '1px solid #0a84ff';
+        div.style.color = '#4fc3ff';
+        div.innerHTML = '🔥 Qazancınızı artırmağa hazırsan!';
+        div.onclick = () => toast('Pik saatlar aktivdir! Tarifiniz yüksəkdir.');
+        notifyList.appendChild(div);
+        toast('🔥 Pik saatlar başladı: Qazancınızı artırmağa hazırsan!');
+    } else if (!isPeak && existingBtn) {
+        existingBtn.remove();
+    }
+  };
+
+  setInterval(window.checkAndNotifyPeakHours, 600000);
+
+  window.fetchCourierData = async () => {
+    if (!window.auth.currentUser) return;
+    const uid = window.auth.currentUser.uid;
+    try {
+        const docRef = window.doc(window.db, "couriers", uid);
+        const docSnap = await window.getDoc(docRef);
+        if (docSnap.exists()) {
+            const data = docSnap.data();
+            if(document.getElementById('nameInput')) document.getElementById('nameInput').value = data.name || '';
+            if(document.getElementById('surnameInput')) document.getElementById('surnameInput').value = data.surname || '';
+            if(document.getElementById('phoneInput')) document.getElementById('phoneInput').value = data.phone || '';
+            if(document.getElementById('balance')) document.getElementById('balance').innerText = (data.walletBalance || 0).toFixed(2);
+            if(document.getElementById('vipBalanceValue')) document.getElementById('vipBalanceValue').innerHTML = (data.walletBalance || 0).toFixed(2) + ' <span style="font-size:20px;">AZN</span>';
+            if(document.getElementById('vipTotalEarned')) document.getElementById('vipTotalEarned').innerText = (data.totalEarnings || 0).toFixed(2);
+            const fullName = [data.name, data.surname].filter(Boolean).join(' ');
+            if(document.getElementById('infoFullName')) document.getElementById('infoFullName').innerText = fullName || 'BakuGo Kuryeri';
+            if(document.getElementById('infoPhoneDisplay')) document.getElementById('infoPhoneDisplay').innerText = data.phone ? '📞 ' + data.phone : '---';
+            if(document.getElementById('infoEmailDisplay')) document.getElementById('infoEmailDisplay').innerText = window.auth.currentUser.email ? '✉️ ' + window.auth.currentUser.email : '---';
+            if(document.getElementById('accountHeroName')) document.getElementById('accountHeroName').innerText = fullName || 'BakuGo Kuryeri';
+            if(document.getElementById('accountHeroEmail')) document.getElementById('accountHeroEmail').innerText = window.auth.currentUser.email || '---';
+            window.profileComplete = !!(data.name && data.surname && data.phone);
+            // Profil tamamlanıbsa localStorage-a da yazırıq - beləliklə, gələcək girişlərdə
+            // Firestore oxuması gecikər/uğursuz olarsa belə (zəif internet və s.), kuryerdən
+            // artıq doldurduğu məlumatları BİR DAHA İSTƏMİRİK. Bu, "hər dəfə soruşur" problemini
+            // şəbəkə qüsurlarına qarşı da davamlı edir.
+            if(window.profileComplete) localStorage.setItem('bakugoProfileComplete_' + uid, '1');
+        } else {
+            window.profileComplete = !!localStorage.getItem('bakugoProfileComplete_' + uid);
+        }
+    } catch (e) {
+        console.error("Xəta:", e);
+        // Firestore oxuması uğursuz olsa belə, əvvəllər tamamlandığını bildiyimiz kuryerə
+        // yenidən ad/soyad/telefon formu göstərməmək üçün keşə güvənirik.
+        window.profileComplete = !!localStorage.getItem('bakugoProfileComplete_' + uid);
+    }
+  };
+
+  window.loadCourierData = async (isGoingOnline) => {
+    if (!window.auth.currentUser) return;
+    try {
+        const courierRef = doc(db, "couriers", window.auth.currentUser.uid);
+        if (isGoingOnline) {
+            // YALNIZ status sahələri yazılır. Əvvəlki kod hər "ONLINE" olanda walletBalance,
+            // totalEarnings, totalDeliveries, rating, isVerified, commissionrate kimi sahələri
+            // 0-a sıfırlayırdı (merge:true mövcud dəyəri qorumur) - kuryerin balansı itirdi.
+            // Kuryer sənədi və bütün ilkin sahələr admin tərəfindən yaradılır.
+            await updateDoc(courierRef, {
+                status: "online",
+                isAvailable: true,
+                lastSeen: new Date()
+            });
+            window.fetchCourierData();
+        } else {
+            await updateDoc(courierRef, {
+                status: "offline",
+                isAvailable: false
+            });
+        }
+    } catch (e) {
+        console.error("Xəta:", e);
+        /* Əvvəl xəta səssiz udulurdu. İndi səbəb ekranda görünür. */
+        var __c = (e && e.code) || '';
+        var __m = (__c === 'not-found')
+            ? 'Bu hesab üçün kuryer sənədi yoxdur. Admin paneldən bu e-poçtla kuryer yaradılmalıdır.'
+            : (__c === 'permission-denied')
+            ? 'Firestore qaydaları ONLINE statusuna icazə vermədi (permission-denied).'
+            : ('Online xətası: ' + (__c || (e && e.message) || 'naməlum'));
+        try { toast('⚠️ ' + __m); } catch(_) { alert(__m); }
+    }
+  };
+
+  /* ---- PUSH BİLDİRİŞ SİSTEMİ (FCM) ----
+     Bildiriş icazəsi istəyir, token alır və couriers/{uid} sənədinə "fcmToken"
+     sahəsi kimi yazır. Cloud Function (functions/indexkuryer10.js) yeni sifariş
+     yaranan kimi bu tokenə push göndərir — tətbiq bağlı olsa belə bildiriş gəlir. */
+  /* Firebase Console → Project settings → Cloud Messaging → Web Push certificates → "Key pair".
+     Boş qalsa, Firebase-in standart açarı işlədilir və push yenə işləyir. */
+  const VAPID_KEY = "";
+
+  window.initPush = async (interactive) => {
+    const say = (m) => { if (interactive) { try { toast(m); } catch(e){} } };
+    /* ---- iOS NATIVE (App Store tətbiqi): WKWebView-da web-push yoxdur, native FCM istifadə olunur ---- */
+    if (window.__isNativeApp) {
+      try {
+        const FM = window.Capacitor.Plugins && window.Capacitor.Plugins.FirebaseMessaging;
+        if (!FM) { console.warn("FirebaseMessaging plugin tapılmadı"); return; }
+        if (!window.auth.currentUser) return;
+        let st = await FM.checkPermissions();
+        if (st.receive !== 'granted' && st.receive !== 'denied') st = await FM.requestPermissions();
+        window.__nativePushGranted = (st.receive === 'granted');
+        if (typeof window.updateNotifPermBox === 'function') window.updateNotifPermBox();
+        if (!window.__nativePushGranted) {
+          say("🔕 Bildiriş icazəsi bağlıdır. iPhone Ayarlar → BakuGo Kuryer → Bildirişlər bölməsindən açın.");
+          return;
+        }
+        const saveToken = async (token) => {
+          if (!token || !window.auth.currentUser) return;
+          await setDoc(doc(db, "couriers", window.auth.currentUser.uid),
+            { fcmToken: token, fcmPlatform: "ios", fcmTokenUpdatedAt: new Date() }, { merge: true });
+        };
+        const res = await FM.getToken();
+        if (res && res.token) { await saveToken(res.token); console.log("✅ iOS push token qeydə alındı"); say("🔔 Bildirişlər aktivdir"); }
+        else say("Bildiriş tokeni alınmadı, bir az sonra yenidən cəhd edin.");
+        if (!window.__nativePushListeners) {
+          window.__nativePushListeners = true;
+          await FM.addListener('tokenReceived', (e) => { saveToken(e && e.token).catch(()=>{}); });
+          await FM.addListener('notificationReceived', (e) => {
+            const n = (e && e.notification) || {};
+            const audio = document.getElementById('notifSound');
+            if (audio) audio.play().catch(() => {});
+            if (typeof toast === 'function') toast('🔔 ' + (n.title || 'Yeni sifariş gəldi!'));
+          });
+        }
+      } catch (e) {
+        console.error("iOS push xətası:", e);
+        say("Bildiriş qoşulmadı: " + ((e && (e.code || e.message)) || 'naməlum xəta'));
+      }
+      return;
+    }
+    try {
+      const supported = await isSupported().catch(() => false);
+      if (!supported) { console.warn("Bu brauzer/mühit push-u dəstəkləmir."); say("Bu cihaz push bildirişlərini dəstəkləmir."); return; }
+      if (!window.auth.currentUser) return;
+
+      let permission = Notification.permission;
+      if (permission === "default") permission = await Notification.requestPermission();
+      if (typeof window.updateNotifPermBox === 'function') window.updateNotifPermBox();
+      if (permission !== "granted") {
+        console.warn("Bildiriş icazəsi verilmədi.");
+        say("🔕 Bildiriş icazəsi bağlıdır. Telefon Ayarlar → Tətbiqlər → BakuGo Kuryer → Bildirişlər bölməsindən açın.");
+        return;
+      }
+
+      const registration = (await (window.__swReady || Promise.resolve(null)))
+                          || await navigator.serviceWorker.register("./sw.js", { scope: "./" });
+      await navigator.serviceWorker.ready;
+      const messaging = getMessaging(app);
+      const tokenOpts = { serviceWorkerRegistration: registration };
+      if (VAPID_KEY && VAPID_KEY.length > 40) tokenOpts.vapidKey = VAPID_KEY;
+      const token = await getToken(messaging, tokenOpts);
+
+      if (token) {
+        await setDoc(doc(db, "couriers", window.auth.currentUser.uid), { fcmToken: token, fcmTokenUpdatedAt: new Date() }, { merge: true });
+        console.log("✅ Push token qeydə alındı");
+        say("🔔 Bildirişlər aktivdir");
+      } else {
+        say("Bildiriş tokeni alınmadı, bir az sonra yenidən cəhd edin.");
+      }
+
+      // Tətbiq açıq olanda (foreground) gələn bildirişlər
+      onMessage(messaging, (payload) => {
+        console.log("📩 Foreground push:", payload);
+        const audio = document.getElementById('notifSound');
+        if (audio) audio.play().catch(() => {});
+        if (typeof toast === 'function') {
+          toast('🔔 ' + (payload.notification?.title || 'Yeni sifariş gəldi!'));
+        }
+      });
+    } catch (e) {
+      console.error("Push init xətası:", e);
+      say("Bildiriş qoşulmadı: " + ((e && (e.code || e.message)) || 'naməlum xəta'));
+    }
+  };
+
+  /* ---- CİHAZ İZİ (İMEİ ƏVƏZEDİCİSİ) ----
+     VACİB: brauzerdə/PWA-da HEÇ BİR JavaScript API real İMEİ-yə giriş vermir (bu, həm
+     Android, həm iOS tərəfindən icazə verilməyən, məxsusiyyəti qoruyan bir məhdudiyyətdir).
+     Bunun əvəzinə, hər cihaz üçün DAİMİ, unikal bir ID yaradıb localStorage-da saxlayırıq -
+     tətbiq silinib yenidən qurulmasa, bu ID sabit qalır. Bu, "eyni telefondan neçə hesab
+     giriş edib" kimi sualları cavablandırmaq üçün İMEİ-nin praktik əvəzedicisidir. */
+  function getOrCreateDeviceId(){
+    let id = localStorage.getItem('bakugoDeviceId');
+    if(!id){
+        id = 'dev_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 12);
+        localStorage.setItem('bakugoDeviceId', id);
+    }
+    return id;
+  }
+
+  async function recordDeviceLogin(user){
+    try{
+        await setDoc(doc(db, "couriers", user.uid), {
+            device: {
+                deviceId: getOrCreateDeviceId(),
+                userAgent: navigator.userAgent,
+                platform: navigator.platform || '',
+                language: navigator.language || '',
+                lastLoginAt: new Date()
+            }
+        }, { merge: true });
+    } catch(e){ console.error("Cihaz izi yazılarkən xəta:", e); }
+  }
+
+  /* ---- BLOK SİSTEMİ (CİHAZ + TELEFON ƏSASLI) ----
+     Admin panelindən bir kuryer bloklananda (couriers/{uid}.isBlocked = true), bu tətbiq:
+       1) Həmin kuryerin cihaz ID-sini "blockedDevices/{deviceId}" sənədinə,
+       2) Telefon nömrəsini "blockedPhones/{phone}" sənədinə yazır.
+     Beləliklə, kuryer Gmail hesabını Firebase Auth-dan silsə belə, EYNİ TELEFONLA/CİHAZLA
+     yenidən qeydiyyatdan keçib (yeni uid ilə) tətbiqə girməyə çalışsa, aşağıdakı yoxlama
+     onu yenə də bloklayacaq — çünki blok artıq uid-ə deyil, cihaza və telefona bağlıdır.
+     Admin, kuryerin blokunu açmaq istəsə, couriers/{uid}.isBlocked sahəsini false etməklə
+     yanaşı, blockedDevices/{deviceId} və blockedPhones/{phone} sənədlərini də silməlidir
+     (admin paneldə "blokdan çıxar" düyməsi bu iki kolleksiyanı da silməlidir). */
+  async function forceBlockedLogout(message){
+    try { await signOut(auth); } catch(e){}
+    document.getElementById('splash').style.display = 'none';
+    document.getElementById('auth').style.display = 'flex';
+    alert("🚫 " + message);
+  }
+
+  async function propagateBlock(uid, phone, reason){
+    const deviceId = getOrCreateDeviceId();
+    try{
+        await setDoc(doc(db, "blockedDevices", deviceId), {
+            blockedAt: new Date(), reason: reason || "Admin tərəfindən bloklanıb", courierUid: uid
+        }, { merge: true });
+        if(phone){
+            await setDoc(doc(db, "blockedPhones", phone), {
+                blockedAt: new Date(), reason: reason || "Admin tərəfindən bloklanıb", courierUid: uid
+            }, { merge: true });
+        }
+    } catch(e){ console.error("Blok yayılarkən xəta:", e); }
+  }
+
+  /* Giriş anında yoxlanılır: cihaz/telefon əvvəlcədən bloklanıbmı, ya da bu hesab bloklanıbmı. */
+  async function checkBlockStatus(user){
+    const deviceId = getOrCreateDeviceId();
+    try{
+        const devBlockSnap = await getDoc(doc(db, "blockedDevices", deviceId));
+        if(devBlockSnap.exists()){
+            await forceBlockedLogout("Bu cihaz bloklanıb. Əlaqə üçün dəstək xidmətinə müraciət edin.");
+            return true;
+        }
+
+        const courierSnap = await getDoc(doc(db, "couriers", user.uid));
+        if(courierSnap.exists()){
+            const cData = courierSnap.data();
+
+            if(cData.isBlocked === true){
+                await propagateBlock(user.uid, cData.phone, cData.blockReason);
+                await forceBlockedLogout("Hesabınız admin tərəfindən bloklanıb.");
+                return true;
+            }
+
+            if(cData.phone){
+                const phoneBlockSnap = await getDoc(doc(db, "blockedPhones", cData.phone));
+                if(phoneBlockSnap.exists()){
+                    await setDoc(doc(db, "couriers", user.uid), {
+                        isBlocked: true, blockReason: "Bu telefon nömrəsi əvvəlki bloklu hesabla əlaqəlidir"
+                    }, { merge: true });
+                    await propagateBlock(user.uid, cData.phone, "Bu telefon nömrəsi əvvəlki bloklu hesabla əlaqəlidir");
+                    await forceBlockedLogout("Bu telefon nömrəsi ilə əlaqəli hesab bloklanıb.");
+                    return true;
+                }
+            }
+        }
+    } catch(e){ console.error("Blok statusu yoxlanarkən xəta:", e); }
+    return false;
+  }
+
+  /* Tətbiq açıq olarkən admin kuryeri bloklasa, canlı olaraq dərhal çıxarır. */
+  let blockUnsub = null;
+  function listenBlockStatus(user){
+    if(blockUnsub) blockUnsub();
+    blockUnsub = onSnapshot(doc(db, "couriers", user.uid), async (snap) => {
+        if(snap.exists() && snap.data().isBlocked === true){
+            const cData = snap.data();
+            if(blockUnsub){ blockUnsub(); blockUnsub = null; }
+            await propagateBlock(user.uid, cData.phone, cData.blockReason);
+            await forceBlockedLogout("Hesabınız admin tərəfindən bloklanıb.");
+        }
+    });
+  }
+
+  onAuthStateChanged(auth, async (user) => {
+    if (user) {
+        // Bu hesab kuryer hesabı olmalıdır (kuryer hesabını admin yaradır)
+        try {
+            const cs = await getDoc(doc(db, "couriers", user.uid));
+            if (!cs.exists()) {
+                try { await signOut(auth); } catch(e){}
+                document.getElementById('splash').style.display = 'none';
+                document.getElementById('auth').style.display = 'flex';
+                alert("Bu hesab kuryer hesabı deyil. Kuryer hesabı admin tərəfindən yaradılır - dəstək xidməti ilə əlaqə saxlayın.");
+                return;
+            }
+        } catch(e){ console.error("Kuryer sənədi yoxlanmadı:", e); }
+        const isBlocked = await checkBlockStatus(user);
+        if (isBlocked) return;
+
+        try { window.startCourierPricingListener(); } catch(e){}
+        enterApp();
+        window.courierDataPromise = window.fetchCourierData();
+        window.courierDataPromise.then(() => {
+            if (typeof window.resumeOnlineIfNeeded === 'function') window.resumeOnlineIfNeeded();
+        });
+        window.listenPreviousOrders();
+        window.listenCourierBalance();
+        window.listenNotifications();
+        window.initPush();
+        recordDeviceLogin(user);
+        listenBlockStatus(user);
+        if (!window.__peakTimer) window.__peakTimer = setInterval(window.checkAndNotifyPeakHours, 600000);
+    } else {
+        document.getElementById('splash').style.display = 'none';
+        document.getElementById('auth').style.display = 'flex';
+    }
+  });
+
+  window.saveUser = async () => {
+    if(!window.auth.currentUser) return;
+    const data = {
+        name: document.getElementById('nameInput').value,
+        surname: document.getElementById('surnameInput').value,
+        phone: document.getElementById('phoneInput').value,
+        updatedAt: new Date()
+    };
+    try {
+        if (data.phone) {
+            const phoneBlockSnap = await getDoc(doc(db, "blockedPhones", data.phone));
+            if (phoneBlockSnap.exists()) {
+                await setDoc(doc(db, "couriers", window.auth.currentUser.uid), {
+                    isBlocked: true, blockReason: "Bu telefon nömrəsi əvvəlki bloklu hesabla əlaqəlidir"
+                }, { merge: true });
+                await propagateBlock(window.auth.currentUser.uid, data.phone, "Bu telefon nömrəsi əvvəlki bloklu hesabla əlaqəlidir");
+                await forceBlockedLogout("Bu telefon nömrəsi ilə əlaqəli hesab bloklanıb.");
+                return;
+            }
+        }
+        await setDoc(doc(db, "couriers", window.auth.currentUser.uid), data, { merge: true });
+        window.fetchCourierData();
+        toast("Məlumatlar yadda saxlanıldı!");
+    } catch(e) { toast("Xəta: " + e.message); }
+  };
+
+  window.openFirstProfileModal = () => {
+    if (!window.auth.currentUser) return;
+    const tag = document.getElementById('firstProfileAccountTag');
+    if (tag) tag.innerText = '🔐 Hesab: ' + (window.auth.currentUser.email || window.auth.currentUser.uid);
+    const modal = document.getElementById('firstProfileModal');
+    if (modal) modal.style.display = 'flex';
+  };
+
+  window.confirmFirstProfile = async () => {
+    if (!window.auth.currentUser) return;
+    const name = document.getElementById('firstNameInput').value.trim();
+    const surname = document.getElementById('firstSurnameInput').value.trim();
+    const phone = document.getElementById('firstPhoneInput').value.trim();
+    if (!name || !surname || !phone) {
+        toast("Zəhmət olmasa bütün xanaları doldurun.");
+        return;
+    }
+
+    try {
+        const phoneBlockSnap = await getDoc(doc(db, "blockedPhones", phone));
+        if (phoneBlockSnap.exists()) {
+            await setDoc(doc(db, "couriers", window.auth.currentUser.uid), {
+                isBlocked: true, phone: phone, blockReason: "Bu telefon nömrəsi əvvəlki bloklu hesabla əlaqəlidir"
+            }, { merge: true });
+            await propagateBlock(window.auth.currentUser.uid, phone, "Bu telefon nömrəsi əvvəlki bloklu hesabla əlaqəlidir");
+            document.getElementById('firstProfileModal').style.display = 'none';
+            await forceBlockedLogout("Bu telefon nömrəsi ilə əlaqəli hesab bloklanıb.");
+            return;
+        }
+    } catch (e) { console.error("Telefon blok yoxlaması xətası:", e); }
+
+    try {
+        await setDoc(doc(db, "couriers", window.auth.currentUser.uid), {
+            name: name,
+            surname: surname,
+            phone: phone,
+            updatedAt: new Date()
+        }, { merge: true });
+        window.profileComplete = true;
+        await window.fetchCourierData();
+        document.getElementById('firstProfileModal').style.display = 'none';
+        toggleStatus();
+    } catch (e) { toast("Xəta: " + e.message); }
+  };
+
+  /* Sifarişdəki məhsulları (ad + miqdar) siyahıda göstərir. Firestore-da sahə adı fərqli
+     saxlanıla bilər deyə bir neçə mümkün açara baxır (items/products/cart/orderItems). */
+  window.renderOrderItems = (orderData) => {
+    const listEl = document.getElementById('prodList');
+    const noteEl = document.getElementById('prodNote');
+    if (!listEl) return;
+
+    const rawItems = orderData.items || orderData.products || orderData.cart || orderData.orderItems || [];
+    listEl.innerHTML = '';
+
+    if (!Array.isArray(rawItems) || rawItems.length === 0) {
+        listEl.innerHTML = "<li style='opacity:.6; justify-content:center;'>Məhsul siyahısı tapılmadı</li>";
+    } else {
+        rawItems.forEach((item) => {
+            const name = item.name || item.productName || item.title || 'Məhsul';
+            const qty = item.quantity ?? item.qty ?? item.count ?? item.amount ?? 1;
+            const li = document.createElement('li');
+            li.innerHTML = `<span class="ol-item-name">${name}</span><span class="ol-item-qty">${qty} əd</span>`;
+            listEl.appendChild(li);
+        });
+    }
+
+    if (noteEl) noteEl.innerText = orderData.note || orderData.orderNote || orderData.comment || 'Yoxdur';
+  };
+
+  let unsubscribeOrders = null;
+  window.listenLiveOrders = () => {
+    // TƏHLÜKƏSİZLİK LİMİTİ: bu sorğu HƏR kuryerin cihazında işə düşür və filtrsiz olaraq
+    // "searching_courier" statuslu BÜTÜN sifarişləri oxuyur (məsafə/rayon filtri yoxdur).
+    // Sifariş sayı normalda kiçikdir, amma limitsiz sorğu bir bug/kütləvi sifariş zamanı
+    // hər kuryer cihazında və hər oxuma üçün Firestore xərcini partlada bilər.
+    const q = query(collection(db, "orders"), where("status", "==", "searching_courier"), limit(20));
+    unsubscribeOrders = onSnapshot(q, async (snapshot) => {
+        snapshot.docChanges().forEach(async (change) => {
+            if (change.type === "removed") {
+                // Sifariş başqa kuryerə keçib / ləğv olunub / axtarış bağlanıb - gözləyən təklifi bağla
+                const m = document.getElementById('ordersModal');
+                if (window.orderDecisionPending && m && m.getAttribute('data-current-id') === change.doc.id) {
+                    window.clearOrderAutoSkip();
+                    stopSoundLoop();
+                    window.orderDecisionPending = false;
+                    const cb = document.getElementById('orderCloseBtn');
+                    if (cb) cb.classList.remove('ol-close-disabled');
+                    hideWazeBtn();
+                    closeModal('ordersModal');
+                    m.removeAttribute('data-current-id');
+                    toast('⏱ Bu sifariş üçün kuryer axtarışı bağlandı.');
+                }
+                return;
+            }
+            if (change.type === "added") {
+                const orderData = change.doc.data();
+                const orderId = change.doc.id;
+                if (window.skippedOrderIds && window.skippedOrderIds.has(orderId)) {
+                    // Restoran "Yenidən kuryer axtar" basıbsa (yeni searchStartedAt) - sifariş yenidən təklif olunur
+                    const skippedStamp = (window.skippedOrderStamp || {})[orderId] || 0;
+                    if ((parseFloat(orderData.searchStartedAt) || 0) > skippedStamp) { window.skippedOrderIds.delete(orderId); }
+                    else return;
+                }
+                // 60 saniyəlik axtarış artıq bitibsə, bu təklifi göstərmə
+                if (parseFloat(orderData.searchStartedAt) && (Date.now() - parseFloat(orderData.searchStartedAt)) >= 60000) {
+                    window.closeExpiredSearch(orderId);
+                    return;
+                }
+
+                document.getElementById('orderIdDisplay').innerText = `# ${orderId.substring(0,8)}`;
+                document.getElementById('customerName').innerText = orderData.customerName || "Tapılmadı";
+                document.getElementById('customerPhone').innerText = `📞 ${orderData.customerPhone || '---'}`;
+                document.getElementById('customerPhone').setAttribute('data-phone', orderData.customerPhone || "");
+                document.getElementById('customerAddress').innerText = orderData.customerAddress || '---';
+                document.getElementById('restaurantName').innerText = orderData.restaurantName || "Tapılmadı";
+                document.getElementById('restaurantAddress').innerText = orderData.restaurantAddress || '---';
+                document.getElementById('restaurantPhone').innerText = `📞 ${orderData.restaurantPhone || "---"}`;
+                document.getElementById('restaurantPhone').setAttribute('data-phone', orderData.restaurantPhone || "");
+                window.renderOrderItems(orderData);
+
+                const isRainy = orderData.isRainy || false;
+
+                document.getElementById('ordersModal').setAttribute('data-current-id', orderId);
+                document.getElementById('ordersModal').setAttribute('data-search-stamp', String(parseFloat(orderData.searchStartedAt) || 0));
+                document.getElementById('ordersModal').removeAttribute('data-restored-active');
+                window.orderDecisionPending = true;
+                const closeBtn = document.getElementById('orderCloseBtn');
+                if (closeBtn) closeBtn.classList.add('ol-close-disabled');
+                document.getElementById('acceptBtnBox').style.display = 'flex';
+                document.getElementById('rejectBtn').style.display = 'block';
+                document.getElementById('collectBtnBox').style.display = 'none';
+                document.getElementById('deliverBtnBox').style.display = 'none';
+                if (typeof window.hideWazeBtn === 'function') window.hideWazeBtn();
+                showOrderTab('active');
+                openModal('ordersModal');
+                playSoundLoop();
+                window.startOrderAutoSkip(orderId, parseFloat(orderData.searchStartedAt) || 0);
+
+                // Real yol məsafəsi/vaxtı hesablanana qədər "canlı hesablanır" effekti
+                const routeStrip = document.getElementById('routeInfoStrip');
+                const distEl = document.getElementById('distance');
+                const etaEl = document.getElementById('etaTime');
+                if (routeStrip) routeStrip.classList.add('ol-route-loading');
+                distEl.innerText = '···';
+                etaEl.innerText = '···';
+                document.getElementById('price').innerText = '···';
+
+                const coordsOk = window.validCoords(orderData.restaurantLat, orderData.restaurantLng) && window.validCoords(orderData.customerLat, orderData.customerLng);
+                const routePromise = coordsOk
+                  ? window.getRealRouteInfo(orderData.restaurantLat, orderData.restaurantLng, orderData.customerLat, orderData.customerLng, (attempt) => {
+                    if (document.getElementById('ordersModal').getAttribute('data-current-id') !== orderId) return;
+                    distEl.innerText = attempt <= 1 ? '···' : `🔄 Cəhd ${attempt}...`;
+                    etaEl.innerText = navigator.onLine ? 'Şəbəkə zəifdir' : 'İnternet gözlənir';
+                  })
+                  : Promise.resolve({ km: 0, minutes: 0, unknown: true });
+                routePromise.then(info => {
+                    // Bu vaxt ərzində sifariş dəyişibsə (rədd olunub / başqa sifariş açılıb), köhnə nəticəni tətbiq etmə
+                    if (document.getElementById('ordersModal').getAttribute('data-current-id') !== orderId) return;
+
+                    if (routeStrip) routeStrip.classList.remove('ol-route-loading');
+                    distEl.innerText = info.unknown ? 'Məlum deyil' : `${info.km} KM`;
+                    etaEl.innerText = info.unknown ? '—' : `${info.minutes} dəq`;
+                    distEl.classList.add('ol-route-pop');
+                    etaEl.classList.add('ol-route-pop');
+                    setTimeout(() => { distEl.classList.remove('ol-route-pop'); etaEl.classList.remove('ol-route-pop'); }, 450);
+
+                    const priceEl = document.getElementById('price');
+                    const earnAmount = window.calculateDynamicPrice(info.km, isRainy);
+                    priceEl.innerText = `${earnAmount} AZN`;
+                    priceEl.classList.add('ol-route-pop');
+                    setTimeout(() => priceEl.classList.remove('ol-route-pop'), 450);
+
+                    document.getElementById('ordersModal').setAttribute('data-order-km', info.km);
+                    document.getElementById('ordersModal').setAttribute('data-order-earn', earnAmount);
+                });
+            }
+        });
+    });
+  };
+
+  window.stopListeningOrders = () => { if (unsubscribeOrders) unsubscribeOrders(); };
+
+  let unsubscribePrevOrders = null;
+  window.listenPreviousOrders = () => {
+    if (!window.auth.currentUser) return;
+    if (unsubscribePrevOrders) unsubscribePrevOrders();
+    // Bu, yalnız görüntü üçün "son sifarişlər" siyahısıdır (balans hesablaması DEYİL - o,
+    // aşağıda listenCourierBalance() içində walletBalance sahəsindən gəlir). Kuryerin illər
+    // ərzində minlərlə çatdırılmış sifarişi ola bilər deyə, son 50 ilə məhdudlaşdırırıq.
+    function renderPrevOrders(snapshot) {
+        const listEl = document.getElementById('prevOrdersList');
+        if (!listEl) return;
+        let items = [];
+        snapshot.forEach((d) => items.push({ id: d.id, ...d.data() }));
+        items.sort((a, b) => (b.deliveredAt || 0) - (a.deliveredAt || 0));
+
+        if (items.length === 0) {
+            listEl.innerHTML = "<p style='opacity:.6;text-align:center;font-size:13px;'>Hələ çatdırılmış sifariş yoxdur</p>";
+            return;
+        }
+
+        listEl.innerHTML = items.map(o => {
+            let dateStr = o.deliveredAt ? new Date(o.deliveredAt).toLocaleString('az-AZ') : '---';
+            return `
+            <div class="big-card" style="flex-direction:column; align-items:flex-start; border-left:4px solid #d4af37; background:#161616;">
+                <small style="color:#d4af37; font-weight:bold; font-size:10px;">#${o.id.substring(0,8)} · ${dateStr}</small>
+                <div style="color:white; font-size:15px; font-weight:600; margin-top:4px;">${o.restaurantName || 'Restoran'} → ${o.customerName || 'Müştəri'}</div>
+                <div style="color:#999; font-size:12px; margin-top:2px;">${o.customerAddress || '---'}</div>
+                <div style="color:#4fc3ff; font-weight:bold; margin-top:6px;">${o.totalAmount || o.price || 0} AZN</div>
+            </div>`;
+        }).join("");
+    }
+    // "courierId" (==) + "status" (==) + "deliveredAt" (orderBy) composite index tələb edir -
+    // Firebase Console ilk xətada yaratmaq üçün link təklif edəcək. Hazır olana qədər limitli
+    // (sıralamasız) fallback-a keçirik ki, tətbiq sınmasın.
+    const q = query(collection(db, "orders"), where("courierId", "==", window.auth.currentUser.uid), where("status", "==", "delivered"), orderBy("deliveredAt", "desc"), limit(50));
+    const qFallback = query(collection(db, "orders"), where("courierId", "==", window.auth.currentUser.uid), where("status", "==", "delivered"), limit(50));
+    unsubscribePrevOrders = onSnapshot(q, renderPrevOrders, (err) => {
+        console.error("Index-li sifariş tarixçəsi sorğusu uğursuz oldu, fallback-a keçirik:", err);
+        unsubscribePrevOrders = onSnapshot(qFallback, renderPrevOrders, (fallbackErr) => {
+            console.error("Sifariş tarixçəsi yüklənmə xətası:", fallbackErr);
+        });
+    });
+  };
+  window.stopListeningPrevOrders = () => { if (unsubscribePrevOrders) unsubscribePrevOrders(); };
+
+  /* ===== PUL ÇIXARMA (WITHDRAW) — kuryer balansı =====
+     YENİ MODEL: "walletBalance" (kuryer sənədində) artıq TƏK həqiqət mənbəyidir (source of
+     truth) - çatdırılanda artır (bax: deliverOrderAction), pul çıxarma SORĞUSU göndəriləndə
+     dərhal azalır (aşağıda, tranzaksiya ilə), rədd edilsə admin panelində geri qaytarılır.
+     Bundan əvvəl balans HƏR DƏFƏ kuryerin BÜTÜN çatdırdığı sifarişləri (limitsiz!) yenidən
+     toplamaqla hesablanırdı - performans problemi idi. Üstəlik, walletBalance pul çıxarma
+     zamanı HEÇ AZALMIRDI - iki fərqli rəqəm eyni ekranda görünə bilirdi (bax: keçən düzəliş
+     qeydi). İndi tək mənbə var və O(1) oxuma ilə (kuryer sənədinin özü) yenilənir. */
+  let courierWalletBalance = 0;
+
+  /* Hər çatdırılmış sifarişi ayrı-ayrı sətir kimi göstərir (YALNIZ görüntü üçün, son 50 ilə
+     məhdudlaşdırılıb - bax: listenPreviousOrders-dəki eyni məhdudiyyət qeydi). */
+  function renderEarnHistory(items){
+    const el = document.getElementById('earnOrdersHistory');
+    if(!el) return;
+    if(items.length === 0){
+        el.innerHTML = "<p style='opacity:.6;text-align:center;font-size:13px;'>Hələ çatdırılmış sifariş yoxdur</p>";
+        return;
+    }
+    let total = 0;
+    const rows = items.map((it, idx) => {
+        total += it.fee;
+        return `
+          <div class="earn-item">
+            <span class="earn-num">${idx + 1}</span>
+            <span class="earn-label">Sifariş #${idx + 1}</span>
+            <span class="earn-amount">+${it.fee.toFixed(2)} AZN</span>
+          </div>`;
+    }).join('');
+    const totalRow = `
+      <div class="earn-total-row">
+        <span class="lbl">Son ${items.length} sifariş cəmi</span>
+        <span class="val">${total.toFixed(2)} AZN</span>
+      </div>`;
+    el.innerHTML = rows + totalRow;
+  }
+
+  window.listenCourierBalance = () => {
+    if (!window.auth.currentUser) return;
+    const uid = window.auth.currentUser.uid;
+
+    // Balans indi BİR sənədin canlı dinlənməsi ilə gəlir (ucuz, O(1)) - kolleksiya
+    // böyüklüyündən asılı deyil.
+    onSnapshot(doc(db, "couriers", uid), (snap) => {
+        const data = snap.data() || {};
+        courierWalletBalance = parseFloat(data.walletBalance || 0);
+        if (courierWalletBalance < 0) courierWalletBalance = 0;
+        const b = document.getElementById('balance');
+        const vip = document.getElementById('vipBalanceValue');
+        const vipTotal = document.getElementById('vipTotalEarned');
+        if(b) b.innerText = courierWalletBalance.toFixed(2);
+        if(vip) vip.innerHTML = courierWalletBalance.toFixed(2) + ' <span style="font-size:20px;">AZN</span>';
+        if(vipTotal) vipTotal.innerText = parseFloat(data.totalEarnings || 0).toFixed(2);
+    });
+
+    // Son 50 çatdırılmış sifariş - YALNIZ itemized görüntü üçün, balans hesablamasında
+    // istifadə OLUNMUR (bax: yuxarıdakı qeyd).
+    const earnQ = query(collection(db, "orders"), where("courierId", "==", uid), where("status", "==", "delivered"), orderBy("deliveredAt", "desc"), limit(50));
+    const earnQFallback = query(collection(db, "orders"), where("courierId", "==", uid), where("status", "==", "delivered"), limit(50));
+    const renderEarnSnap = (snap) => {
+        const items = [];
+        snap.forEach((d) => {
+            const o = d.data();
+            items.push({ fee: parseFloat(o.courierEarn ?? o.courierFee ?? 0), deliveredAt: o.deliveredAt || 0 });
+        });
+        items.sort((a, b) => (a.deliveredAt || 0) - (b.deliveredAt || 0));
+        renderEarnHistory(items);
+    };
+    onSnapshot(earnQ, renderEarnSnap, (err) => {
+        console.error("Index-li qazanc tarixçəsi sorğusu uğursuz oldu, fallback-a keçirik:", err);
+        onSnapshot(earnQFallback, renderEarnSnap, (fallbackErr) => console.error("Qazanc tarixçəsi yüklənmə xətası:", fallbackErr));
+    });
+
+    // Pul çıxarma sorğuları tarixçəsi (görüntü üçün, son 50) - balans artıq walletBalance-dan
+    // gəldiyi üçün bu sorğu heç bir toplama aparmır.
+    const wQ = query(collection(db, "withdrawals"), where("courierId", "==", uid), orderBy("createdAt", "desc"), limit(50));
+    const wQFallback = query(collection(db, "withdrawals"), where("courierId", "==", uid), limit(50));
+    const renderWithdrawals = (snap) => {
+        let items = [];
+        snap.forEach((d) => items.push({ id: d.id, ...d.data() }));
+        items.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+        const histEl = document.getElementById('courierWithdrawHistory');
+        if (histEl) {
+            if (items.length === 0) {
+                histEl.innerHTML = "<p style='opacity:.6;text-align:center;font-size:13px;'>Sorğu tarixçəsi yoxdur</p>";
+            } else {
+                const cls = { pending: "wstatus-pending", approved: "wstatus-approved", rejected: "wstatus-rejected" };
+                const label = { pending: "⏳ Gözləyir", approved: "✅ Təsdiqləndi", rejected: "❌ Rədd edildi" };
+                histEl.innerHTML = items.map(w => `
+                  <div class="item" style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #222;">
+                    <div><b>${parseFloat(w.amount).toFixed(2)} AZN</b><br><small style="color:#999;">${w.card || ''}</small></div>
+                    <small class="${cls[w.status] || ''}">${label[w.status] || w.status}</small>
+                  </div>`).join("");
+            }
+        }
+    };
+    onSnapshot(wQ, renderWithdrawals, (err) => {
+        console.error("Index-li pul çıxarma tarixçəsi sorğusu uğursuz oldu, fallback-a keçirik:", err);
+        onSnapshot(wQFallback, renderWithdrawals, (fallbackErr) => console.error("Pul çıxarma tarixçəsi yüklənmə xətası:", fallbackErr));
+    });
+  };
+
+  window.openCourierWithdraw = () => {
+    if (!window.auth.currentUser) { toast("Login olun!"); return; }
+    document.getElementById('courierWithdrawBalance').innerText = courierWalletBalance.toFixed(2) + " AZN";
+    openModal('courierWithdrawModal');
+  };
+
+  window.submitCourierWithdraw = async () => {
+    const user = window.auth.currentUser;
+    if (!user) { toast("Login olun!"); return; }
+
+    const amount = parseFloat(document.getElementById('courierWithdrawAmount').value);
+    const card = document.getElementById('courierWithdrawCard').value.trim();
+
+    if (!amount || amount <= 0) { toast("Məbləği düzgün daxil edin!"); return; }
+    if (!card) { toast("Kart nömrəsi / IBAN daxil edin!"); return; }
+
+    try {
+        const nameEl = document.getElementById('infoFullName');
+        const courierRef = doc(db, "couriers", user.uid);
+        const withdrawalRef = doc(collection(db, "withdrawals"));
+        // TRANZAKSİYA: balansı yoxlamaq və azaltmaq eyni atomik əməliyyatda baş verir ki,
+        // kuryer eyni anda iki sorğu göndərib balansdan çox pul "bloklaya" bilməsin (əvvəlki
+        // kodda bu yoxlama client-də, köhnəlmiş dəyərlə aparılırdı - yarış vəziyyəti/race
+        // condition mümkün idi).
+        await runTransaction(db, async (tx) => {
+            const courierSnap = await tx.get(courierRef);
+            const currentBalance = parseFloat((courierSnap.exists() ? courierSnap.data().walletBalance : 0) || 0);
+            if (amount > currentBalance) {
+                throw new Error("INSUFFICIENT_BALANCE");
+            }
+            tx.update(courierRef, { walletBalance: increment(-amount) });
+            tx.set(withdrawalRef, {
+                type: "courier",
+                courierId: user.uid,
+                courierName: (nameEl && nameEl.innerText) || "Kuryer",
+                amount,
+                card,
+                status: "pending",
+                createdAt: Date.now()
+            });
+        });
+        document.getElementById('courierWithdrawAmount').value = "";
+        document.getElementById('courierWithdrawCard').value = "";
+        toast("Pul çıxarma sorğunuz göndərildi! Admin təsdiqləyəndən sonra ödəniş ediləcək.");
+        closeModal('courierWithdrawModal');
+    } catch (e) {
+        if (e.message === "INSUFFICIENT_BALANCE") toast("Balansınız kifayət qədər deyil!");
+        else toast("Xəta baş verdi: " + e.message);
+    }
+  };
+
+  let notifStarted = false;
+  /* Bildirişlərin "oxunub/oxunmayıb" statusu cihazda (localStorage) saxlanılır.
+     Bildiriş panelini açanda həmin an mövcud olan bütün bildirişlər "oxunmuş" sayılır
+     və nişan (badge) dərhal 0-a düşür — geri qayıdanda təkrar köhnə say göstərilmir. */
+  function getReadNotifIds(){
+      try { return new Set(JSON.parse(localStorage.getItem('bakugo_courier_read_notifs') || '[]')); }
+      catch(e){ return new Set(); }
+  }
+  function saveReadNotifIds(idsSet){
+      try { localStorage.setItem('bakugo_courier_read_notifs', JSON.stringify(Array.from(idsSet))); }
+      catch(e){}
+  }
+  window.latestNotifItems = [];
+  window.updateNotifPermBox = function(){
+      const box = document.getElementById('notifPermBox');
+      if (!box) return;
+      const ok = window.__isNativeApp ? !!window.__nativePushGranted : (('Notification' in window) && Notification.permission === 'granted');
+      box.style.display = ok ? 'none' : 'block';
+  };
+  window.openNotifications = function(){
+      openModal('notifyModal');
+      window.updateNotifPermBox();
+      const readIds = getReadNotifIds();
+      window.latestNotifItems.forEach(n => readIds.add(n.id));
+      saveReadNotifIds(readIds);
+      const badge = document.getElementById('notifyBadge');
+      if (badge) badge.style.display = 'none';
+  };
+
+  function handleCourierNotifSnapshot(snapshot) {
+        const container = document.getElementById('fbNotifyContainer');
+        const badge = document.getElementById('notifyBadge');
+        let items = [];
+        snapshot.forEach((d) => items.push({ id: d.id, ...d.data() }));
+        items.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        window.latestNotifItems = items;
+
+        if (container) {
+            if (items.length === 0) {
+                container.innerHTML = "<p style='opacity:.6;text-align:center;font-size:13px;'>Bildiriş yoxdur</p>";
+            } else {
+                container.innerHTML = items.map(n => `
+                    <div class="btn" style="flex-direction:column; align-items:flex-start; cursor:default;">
+                        <b>${n.title || 'Bildiriş'}</b>
+                        <span style="opacity:.75; font-size:13px; margin-top:4px;">${n.body || ''}</span>
+                    </div>`).join("");
+            }
+        }
+        if (badge) {
+            const readIds = getReadNotifIds();
+            const unreadCount = items.filter(n => !readIds.has(n.id)).length;
+            const modalOpen = document.getElementById('notifyModal') && document.getElementById('notifyModal').classList.contains('active');
+            if (unreadCount > 0 && !modalOpen) { badge.style.display = 'flex'; badge.innerText = unreadCount > 9 ? '9+' : unreadCount; }
+            else { badge.style.display = 'none'; }
+        }
+
+        if (notifStarted) {
+            snapshot.docChanges().forEach((change) => {
+                if (change.type === "added") {
+                    const n = change.doc.data();
+                    if (navigator.vibrate) navigator.vibrate([300, 120, 300]);
+                    try { toast('🔔 ' + (n.title || 'Yeni bildiriş')); } catch(e){}
+                    if (window.showSystemNotif) window.showSystemNotif(n.title || 'BakuGo Kuryer', n.body || '', 'notif-' + change.doc.id);
+                    if (window.notifSoundEnabled !== false) {
+                        const a = document.getElementById('notifSound');
+                        if (a) { try { a.currentTime = 0; a.play().catch(()=>{}); } catch(e){} }
+                    }
+                }
+            });
+        }
+        notifStarted = true;
+  }
+
+  window.listenNotifications = () => {
+    // ƏSAS sorğu: server tərəfdə sıralanır, hər sessiyada YALNIZ son 50 bildiriş oxunur
+    // (əvvəllər limitsiz idi - kolleksiya böyüdükcə hər kuryer HAMISINI oxuyurdu).
+    // "audience" (in) + "createdAt" (orderBy) birləşməsi composite index tələb edir -
+    // Firebase Console ilk xətada onu yaratmaq üçün birbaşa link təklif edəcək.
+    const qOrdered = query(
+        collection(db, "notifications"),
+        where("audience", "in", ["courier", "all"]),
+        orderBy("createdAt", "desc"),
+        limit(50)
+    );
+    // FALLBACK: index hələ hazır deyilsə, limitli (200) köhnə üsula keçirik ki,
+    // index yaradılana qədər tətbiq sınmasın, amma yenə də sərhədsiz qalmasın.
+    const qFallback = query(
+        collection(db, "notifications"),
+        where("audience", "in", ["courier", "all"]),
+        limit(200)
+    );
+    onSnapshot(qOrdered, handleCourierNotifSnapshot, (err) => {
+        console.error("Index-li bildiriş sorğusu uğursuz oldu, fallback-a keçirik:", err);
+        onSnapshot(qFallback, handleCourierNotifSnapshot, (fallbackErr) => {
+            console.error("Bildirişlər yüklənmə xətası:", fallbackErr);
+            try { toast('⚠️ Bildirişlər oxunmadı: ' + ((fallbackErr && fallbackErr.code) || 'xəta')); } catch(e){}
+        });
+    });
+  };
+</script>
+
+<script>
+let map = L.map('map').setView([40.4093, 49.8671], 13);
+
+/* Naviqasiya provayderi: tətbiqdaxili xəritə HƏMİŞƏ Google Maps-dır.
+   Seçim yalnız xəritə görünüşünü (adi / peyk) və "Naviqasiyanı aç" düyməsinin hansı tətbiqi açdığını dəyişir. */
+window.navProvider = localStorage.getItem('bakugoNavProvider') || 'google';
+if (window.navProvider === 'osm') { window.navProvider = 'google'; try { localStorage.setItem('bakugoNavProvider', 'google'); } catch(e){} }
+
+function currentMapMode(){
+    return document.body.classList.contains('light-mode') ? 'light' : 'dark';
+}
+
+function applyMapTileStyle(provider){
+    const type = provider === 'yandex' ? 'hybrid' : 'roadmap';
+    map.setLook(type, currentMapMode() === 'dark');
+}
+
+window.refreshMapThemeStyle = function(){
+    if (typeof map !== 'undefined' && map) applyMapTileStyle(window.navProvider);
+};
+
+function updateNavProviderUI(provider){
+    ['google','waze','yandex'].forEach(p => {
+        const el = document.getElementById('navCard-' + p);
+        if(el) el.classList.toggle('active', p === provider);
+    });
+}
+
+applyMapTileStyle(window.navProvider);
+updateNavProviderUI(window.navProvider);
+
+let restaurantMarker = null;
+let customerMarker = null;
+
+const luxeGoldIcon = (emoji) => L.divIcon({
+    className: '',
+    html: `<div style="width:34px;height:34px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#eaf6ff,#0a84ff 60%,#003a75);border:2px solid #ffffff;box-shadow:0 0 16px rgba(10,132,255,0.55),0 4px 10px rgba(0,0,0,0.25);display:flex;align-items:center;justify-content:center;font-size:16px;">${emoji}</div>`,
+    iconSize: [34, 34],
+    iconAnchor: [17, 17]
+});
+
+/* POPULYAR YERLƏR — KFC, McDonald's, Mall və Wolt tərəfdaşı populyar restoranlar.
+   Bu ikon Wolt-dakı alovlu görünüşdən ilhamlanıb, amma fərqli rəng/formada (qızıl-narıncı, damla-alov formalı). */
+const hotspotIcon = () => L.divIcon({
+    className: '',
+    html: '<div class="hotspot-marker"><span>🔥</span></div>',
+    iconSize: [34, 34],
+    iconAnchor: [17, 30]
+});
+
+const hotspotPlaces = [
+    { name: "KFC — Nizami Mall", lat: 40.3787445, lng: 49.8307117, type: "KFC" },
+    { name: "KFC — Fəvvərələr Meydanı", lat: 40.3700683, lng: 49.8357972, type: "KFC" },
+    { name: "KFC — Sahil", lat: 40.3725244, lng: 49.8441651, type: "KFC" },
+    { name: "McDonald's — Fountains Square", lat: 40.3717613, lng: 49.8377039, type: "McDonald's" },
+    { name: "McDonald's — Nəsimi", lat: 40.3956886, lng: 49.8403637, type: "McDonald's" },
+    { name: "McDonald's — Sahil", lat: 40.3721884, lng: 49.8441032, type: "McDonald's" },
+    { name: "Ganjlik Mall", lat: 40.4001309, lng: 49.8529446, type: "Mall" },
+    { name: "Port Baku Mall", lat: 40.3751486, lng: 49.8602985, type: "Mall" },
+    { name: "28 Mall", lat: 40.3790625, lng: 49.8467654, type: "Mall" },
+    { name: "Crescent Mall", lat: 40.3742973, lng: 49.8609007, type: "Mall" },
+    { name: "Dəniz Mall", lat: 40.3587711, lng: 49.8368638, type: "Mall" },
+    { name: "Park Bulvar", lat: 40.3706875, lng: 49.8496875, type: "Mall" },
+    { name: "Pizza Hut — Fəvvərələr Meydanı", lat: 40.3702354, lng: 49.8356289, type: "Restoran" },
+    { name: "Domino's Pizza — Azadlıq", lat: 40.3736606, lng: 49.8502791, type: "Restoran" },
+    { name: "Papa John's — Nizami", lat: 40.3736219, lng: 49.843247, type: "Restoran" }
+];
+
+let hotspotsLayer = L.layerGroup();
+let hotspotsVisible = false;
+
+hotspotPlaces.forEach(function(p){
+    L.marker([p.lat, p.lng], { icon: hotspotIcon() })
+        .bindPopup(`<b>${p.name}</b><br><small>${p.type}</small>`)
+        .addTo(hotspotsLayer);
+});
+
+function toggleHotspots(){
+    if (!document.body.classList.contains('premium')) {
+        toast('🔥 Populyar yerlər yalnız ONLAYN rejimdə görünür. Əvvəlcə onlayn olun.');
+        return;
+    }
+    hotspotsVisible = !hotspotsVisible;
+    const icon = document.getElementById('hotspotIcon');
+    if (hotspotsVisible) {
+        hotspotsLayer.addTo(map);
+        if (icon) icon.style.boxShadow = '0 0 18px rgba(255,120,0,0.85), inset 0 0 10px rgba(255,255,255,0.08)';
+    } else {
+        map.removeLayer(hotspotsLayer);
+        if (icon) icon.style.boxShadow = '';
+    }
+}
+
+let routingControl = L.Routing.control({
+    waypoints: [],
+    lineOptions: { styles: [{ color: '#0a5fd6', weight: 6, opacity: 0.95 }, { color: '#eaf6ff', weight: 2, opacity: 0.7 }] },
+    addWaypoints: false,
+    draggableWaypoints: false,
+    fitSelectedRoutes: true,
+    showAlternatives: false,
+    createMarker: function() { return null; }
+}).addTo(map);
+
+let courierMarker = L.marker([40.4093, 49.8671], {
+    icon: L.divIcon({
+        className: '',
+        html: '<div class="courier-wrap" id="courierWrap"><div class="courier-arrow"></div><div class="courier-circle"></div></div>',
+        iconSize: [40, 40],
+        iconAnchor: [20, 20]
+    })
+}).addTo(map);
+
+routingControl.on('routesfound', function(e) {
+    var routes = e.routes;
+    var summary = routes[0].summary;
+    const km = (summary.totalDistance / 1000).toFixed(1);
+    document.getElementById('distance').innerText = `📏 ${km} KM`;
+});
+
+window.validCoords = function(lat, lng){
+    const a = parseFloat(lat), b = parseFloat(lng);
+    return isFinite(a) && isFinite(b) && !(a === 0 && b === 0);
+};
+function updateRoute(lat, lng) {
+    if (!courierMarker) return;
+    if (!window.validCoords(lat, lng)) return;
+    const currentPos = courierMarker.getLatLng();
+    routingControl.setWaypoints([
+        L.latLng(currentPos.lat, currentPos.lng),
+        L.latLng(parseFloat(lat), parseFloat(lng))
+    ]);
+}
+
+function calculateBearing(lat1, lon1, lat2, lon2) {
+    const toRad = deg => deg * Math.PI / 180;
+    const toDeg = rad => rad * 180 / Math.PI;
+    const dLon = toRad(lon2 - lon1);
+    const y = Math.sin(dLon) * Math.cos(toRad(lat2));
+    const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) - Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLon);
+    const brng = toDeg(Math.atan2(y, x));
+    return (brng + 360) % 360;
+}
+
+function updateCourierHeading(bearing) {
+    const el = courierMarker.getElement();
+    if (!el) return;
+    const wrap = el.querySelector('#courierWrap') || el.querySelector('.courier-wrap');
+    if (wrap) wrap.style.transform = `rotate(${bearing}deg)`;
+}
+
+function moveMarkerSmoothly(marker, newLat, newLng) {
+    let oldLatLng = marker.getLatLng();
+    if (Math.abs(newLat - oldLatLng.lat) > 0.00003 || Math.abs(newLng - oldLatLng.lng) > 0.00003) {
+        const bearing = calculateBearing(oldLatLng.lat, oldLatLng.lng, newLat, newLng);
+        updateCourierHeading(bearing);
+    }
+    let duration = 3000;
+    let steps = 30;
+    let latStep = (newLat - oldLatLng.lat) / steps;
+    let lngStep = (newLng - oldLatLng.lng) / steps;
+    let i = 0;
+    let timer = setInterval(() => {
+        i++;
+        let nextLat = oldLatLng.lat + (latStep * i);
+        let nextLng = oldLatLng.lng + (lngStep * i);
+        marker.setLatLng([nextLat, nextLng]);
+        if (i >= steps) clearInterval(timer);
+    }, duration / steps);
+}
+
+function callRestaurant() {
+    const phone = document.getElementById('restaurantPhone').getAttribute('data-phone');
+    if(phone && phone !== '---') window.location.href = `tel:${phone}`;
+}
+
+function callCustomer() {
+    const phone = document.getElementById('customerPhone').getAttribute('data-phone');
+    if(phone && phone !== '---') window.location.href = `tel:${phone}`;
+}
+
+function showWazeBtn(lat, lng) {
+    if (!window.validCoords(lat, lng)) return;
+    window.wazeTarget = { lat, lng };
+    const box = document.getElementById('wazeMapBtn');
+    if (box) box.style.display = 'flex';
+}
+
+function hideWazeBtn() {
+    window.wazeTarget = null;
+    const box = document.getElementById('wazeMapBtn');
+    if (box) box.style.display = 'none';
+}
+
+function openWazeNav() {
+    const t = window.wazeTarget;
+    if (!t) return;
+    const provider = window.navProvider || 'google';
+    if(provider === 'yandex') {
+        window.open(`https://yandex.com/maps/?rtext=~${t.lat},${t.lng}&rtt=auto`, '_blank');
+    } else if(provider === 'google') {
+        window.open(`https://www.google.com/maps/dir/?api=1&destination=${t.lat},${t.lng}&travelmode=driving&dir_action=navigate`, '_blank');
+    } else {
+        window.open(`https://www.waze.com/ul?ll=${t.lat},${t.lng}&navigate=yes`, '_blank');
+    }
+}
+
+let watchId = null;
+let touchStartY = 0;
+window.orderDecisionPending = false;
+
+let modalY = 0;
+const orderModal = document.getElementById('ordersModal');
+
+orderModal.addEventListener('touchstart', (e) => { modalY = e.touches[0].clientY; });
+orderModal.addEventListener('touchmove', (e) => {
+    let diff = e.touches[0].clientY - modalY;
+    if (diff > 100) { closeOrderModal(); }
+});
+
+function handleTouchStart(e) { touchStartY = e.touches[0].clientY; }
+function handleTouchMove(e) {
+    if (touchStartY - e.touches[0].clientY > 50) {
+        if (document.getElementById('collectBtnBox').style.display === 'block' || document.getElementById('deliverBtnBox').style.display === 'block') {
+            openModal('ordersModal');
+        }
+    }
+}
+
+function startLiveTracking() {
+    if (!navigator.geolocation) { toast("GPS dəstəklənmir"); return; }
+    navigator.geolocation.getCurrentPosition((position) => {
+        const lat = position.coords.latitude;
+        const lng = position.coords.longitude;
+        courierMarker.setLatLng([lat, lng]);
+        map.setView([lat, lng], 15);
+        startWatchTracking();
+    });
+}
+
+// Kuryerin son Firestore-a yazılan mövqeyi və vaxtı - Wolt-tərzi throttling üçün.
+// Əvvəllər HƏR GPS nöqtəsində (adətən 1-3 saniyədə bir) Firestore-a yazılırdı və
+// marşrut tam yenidən hesablanırdı - yüzlərlə aktiv kuryerdə bu, həm yazma xərcini,
+// həm batareyanı, həm də şəbəkəni lazımsız yerə yükləyirdi. İndi marker ekranda
+// YENƏ DƏ hamar (hər GPS nöqtəsində) hərəkət edir, amma server yazması və marşrut
+// yenidən hesablanması yalnız MƏSAFƏ (15m+) VƏ YA VAXT (4san+) həddi aşanda baş verir.
+let __lastWrittenPos = null;
+let __lastWriteTime = 0;
+const MIN_WRITE_INTERVAL_MS = 4000;
+const MIN_WRITE_DISTANCE_M = 15;
+
+function distanceMeters(lat1, lng1, lat2, lng2){
+    const R = 6371000;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLng/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+function startWatchTracking() {
+    if (watchId !== null) return;
+    const options = { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 };
+    watchId = navigator.geolocation.watchPosition(
+        async (position) => {
+            const lat = position.coords.latitude;
+            const lng = position.coords.longitude;
+            // Ekranda marker HƏR ZAMAN hamar hərəkət edir - bu, yalnız vizual/lokal
+            // əməliyyatdır, heç bir server sorğusu yaratmır.
+            moveMarkerSmoothly(courierMarker, lat, lng);
+
+            const now = Date.now();
+            const movedEnough = !__lastWrittenPos || distanceMeters(__lastWrittenPos.lat, __lastWrittenPos.lng, lat, lng) >= MIN_WRITE_DISTANCE_M;
+            const enoughTimePassed = (now - __lastWriteTime) >= MIN_WRITE_INTERVAL_MS;
+            if(!movedEnough && !enoughTimePassed) return; // hələ həddi aşmayıb - server yazması YOX
+
+            __lastWrittenPos = { lat, lng };
+            __lastWriteTime = now;
+
+            if(routingControl.getWaypoints().length > 1) {
+                const destination = routingControl.getWaypoints()[1].latLng;
+                routingControl.setWaypoints([L.latLng(lat, lng), destination]);
+            }
+
+            try {
+                if (window.auth && window.auth.currentUser) {
+                    await window.updateDoc(window.doc(window.db, "couriers", window.auth.currentUser.uid), { lat: lat, lng: lng, lastSeen: new Date() });
+                    // Müştəri tətbiqi kuryerin canlı mövqeyini sifariş sənədindən oxuyur
+                    const __liveOid = window.activeAcceptedOrderId;
+                    if (__liveOid) {
+                        try { await window.updateDoc(window.doc(window.db, "orders", __liveOid), { lat: lat, lng: lng }); }
+                        catch (e2) { console.warn("Sifarişə canlı koordinat yazılmadı:", e2.code || e2.message); }
+                    }
+                }
+            } catch (e) { console.error("❌ Firebase xətası:", e); }
+        },
+        null,
+        options
+    );
+}
+
+function stopLiveTracking() {
+    if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+}
+
+let online=false;
+window.online = online;
+window.profileComplete = false;
+
+setTimeout(()=>{
+    if(document.getElementById('splash').style.display !== 'none' && document.getElementById('auth').style.display === 'none') {
+        document.getElementById('splash').style.display='none';
+    }
+},3000);
+
+function enterApp(){document.getElementById('auth').style.display='none'; document.getElementById('splash').style.display='none';}
+function register(){window.open('https://wa.me/994702484852?text=Qeydiyyat olmaq istəyirəm');}
+
+function openLogin() { document.getElementById('loginModal').style.display = 'flex'; }
+function closeLogin() { document.getElementById('loginModal').style.display = 'none'; }
+
+async function resetPassword() {
+    const email = document.getElementById('loginEmail').value;
+    if(!email) { toast("Zəhmət olmasa, əvvəlcə Email sahəsini doldurun."); return; }
+    try {
+        await window.sendPasswordResetEmail(window.auth, email);
+        toast("Şifrə sıfırlama linki email ünvanınıza göndərildi!");
+    } catch(e) { toast("Xəta baş verdi: " + e.message); }
+}
+
+async function securityResetPassword() {
+    const user = window.auth.currentUser;
+    if(!user || !user.email) { toast("Email tapılmadı."); return; }
+    if(!confirm(`${user.email} ünvanına şifrə yeniləmə linki göndərilsin?`)) return;
+    try {
+        await window.sendPasswordResetEmail(window.auth, user.email);
+        toast("🔒 Şifrə yeniləmə linki email ünvanınıza göndərildi!");
+    } catch(e) { toast("Xəta baş verdi: " + e.message); }
+}
+
+/* ===== BİLDİRİŞ SƏSİ AÇ/BAĞLA ===== */
+window.notifSoundEnabled = localStorage.getItem('bakugoSoundEnabled') !== 'false';
+
+function toggleNotifSound(){
+    window.notifSoundEnabled = !window.notifSoundEnabled;
+    localStorage.setItem('bakugoSoundEnabled', window.notifSoundEnabled);
+    updateSoundToggleUI();
+    toast(window.notifSoundEnabled ? '🔔 Sifariş səsi aktiv edildi' : '🔕 Sifariş səsi söndürüldü');
+}
+
+function updateSoundToggleUI(){
+    const el = document.getElementById('soundToggle');
+    if(el) el.classList.toggle('on', window.notifSoundEnabled);
+}
+updateSoundToggleUI();
+
+/* ===== DOSTU DƏVƏT ET (REFERRAL) ===== */
+function generateReferralCode(uid){
+    return 'BKG-' + uid.slice(-6).toUpperCase();
+}
+
+async function openReferral(){
+    openModal('referralModal');
+    const user = window.auth.currentUser;
+    if(!user){ toast('Zəhmət olmasa əvvəlcə daxil ol.'); return; }
+    const code = generateReferralCode(user.uid);
+    const codeEl = document.getElementById('referralCodeText');
+    const countEl = document.getElementById('referralCountText');
+    if(codeEl) codeEl.innerText = code;
+    try {
+        const ref = window.doc(window.db, "couriers", user.uid);
+        const snap = await window.getDoc(ref);
+        const data = snap.exists() ? snap.data() : {};
+        if(!data.referralCode){
+            await window.setDoc(ref, { referralCode: code, referralCount: data.referralCount || 0 }, { merge: true });
+        }
+        if(countEl) countEl.innerText = data.referralCount || 0;
+    } catch(e) { console.error("Referral xətası:", e); }
+}
+
+function copyReferralCode(){
+    const code = document.getElementById('referralCodeText').innerText;
+    if(!code || code === '---') return;
+    navigator.clipboard.writeText(code).then(()=> toast('📋 Kod kopyalandı!')).catch(()=> toast('Kopyalama alınmadı'));
+}
+
+function shareReferralCode(){
+    const code = document.getElementById('referralCodeText').innerText;
+    if(!code || code === '---') return;
+    const text = `BakuGo Kuryerinə mənim dəvət kodumla qoşul: ${code} 🎁`;
+    if(navigator.share){
+        navigator.share({ title: 'BakuGo Kuryer', text: text }).catch(()=>{});
+    } else {
+        navigator.clipboard.writeText(text).then(()=> toast('📋 Dəvət mətni kopyalandı!'));
+    }
+}
+
+async function performLogin(){
+    const email = document.getElementById('loginEmail').value.trim();
+    const password = document.getElementById('loginPass').value;
+    if(!email || !password){ toast("E-poçt və şifrəni daxil edin."); return; }
+    try {
+        await window.signInWithEmailAndPassword(window.auth, email, password);
+        document.getElementById('auth').style.display='none';
+        closeLogin();
+    } catch(e) {
+        const m = {
+            "auth/invalid-credential": "E-poçt və ya şifrə yanlışdır.",
+            "auth/wrong-password": "Şifrə yanlışdır.",
+            "auth/user-not-found": "Bu e-poçtla hesab tapılmadı.",
+            "auth/invalid-email": "E-poçt formatı düzgün deyil.",
+            "auth/too-many-requests": "Çox cəhd edildi. Bir az gözləyib yenidən yoxlayın.",
+            "auth/network-request-failed": "İnternet bağlantısında problem var.",
+            "auth/user-disabled": "Bu hesab bloklanıb."
+        };
+        toast("Giriş xətası: " + (m[e.code] || e.message));
+    }
+}
+
+async function logout() {
+    if (confirm("Hesabdan çıxmaq istədiyinizə əminsiniz?")) {
+        try { await window.signOut(window.auth); location.reload(); } catch (e) { toast("Çıxış zamanı xəta baş verdi: " + e.message); }
+    }
+}
+
+/* HESABIN SİLİNMƏSİ — Apple/Google mağaza tələblərinə uyğun.
+   Firebase tələb edir ki, hesab silinməzdən əvvəl istifadəçi yaxınlarda
+   yenidən doğrulanmış (re-authenticated) olsun, ona görə şifrə soruşulur.
+   Əvvəlcə Firestore-dakı profil sənədi, sonra Auth hesabı silinir. */
+async function confirmDeleteAccount(){
+    const user = window.auth.currentUser;
+    if(!user){ toast("Zəhmət olmasa yenidən daxil olun."); return; }
+
+    const password = document.getElementById('deleteAccountPassword').value;
+    if(!password){ toast("Zəhmət olmasa şifrənizi daxil edin."); return; }
+
+    if(!confirm("Son təsdiq: hesabınız və bütün məlumatlarınız həmişəlik silinəcək. Davam edilsin?")) return;
+
+    try {
+        const credential = window.EmailAuthProvider.credential(user.email, password);
+        await window.reauthenticateWithCredential(user, credential);
+
+        try {
+            await window.deleteDoc(window.doc(window.db, "couriers", user.uid));
+        } catch(e) { console.error("Profil sənədi silinərkən xəta:", e); }
+
+        await window.deleteUser(user);
+
+        toast("Hesabınız silindi.");
+        setTimeout(() => location.reload(), 1200);
+    } catch(e) {
+        if(e.code === 'auth/wrong-password' || e.code === 'auth/invalid-credential'){
+            toast("Şifrə yanlışdır.");
+        } else if(e.code === 'auth/too-many-requests'){
+            toast("Çox sayda cəhd. Bir az sonra yenidən yoxlayın.");
+        } else {
+            toast("Xəta: " + e.message);
+        }
+    }
+}
+
+async function toggleStatus(){
+if(!online){
+    if (window.courierDataPromise) { try { await window.courierDataPromise; } catch(e){} }
+    if (!window.profileComplete) {
+        openFirstProfileModal();
+        return;
+    }
+}
+online=!online;
+window.online = online; 
+let s=document.getElementById('slider');
+let panel=document.getElementById('onlinePanel');
+let status=document.getElementById('statusText');
+
+if(online){
+s.classList.add('premium');
+s.innerText='ONLINE';
+s.style.left='calc(50% - 5px)';
+panel.classList.add('active');
+status.classList.remove('active');
+window.loadCourierData(true);
+if (typeof window.initPush === 'function') window.initPush();
+enablePremium();
+startLiveTracking();
+if (typeof window.listenLiveOrders === 'function') { window.listenLiveOrders(); }
+if (typeof window.listenMyActiveOrder === 'function') { window.listenMyActiveOrder(); }
+try { localStorage.setItem('bakugoWasOnline', '1'); } catch(e){}
+setTimeout(()=>{ panel.classList.remove('active'); status.classList.add('active'); },4000);
+}else{
+s.classList.remove('premium');
+s.innerText='OFFLINE';
+s.style.left='5px';
+panel.classList.remove('active');
+status.classList.remove('active');
+document.body.classList.remove('premium');
+window.loadCourierData(false);
+stopLiveTracking();
+if (typeof window.stopListeningOrders === 'function') { window.stopListeningOrders(); }
+if (typeof window.stopListeningMyActiveOrder === 'function') { window.stopListeningMyActiveOrder(); }
+try { localStorage.setItem('bakugoWasOnline', '0'); } catch(e){}
+}
+}
+
+/* Kuryer ONLINE ikən tətbiqdən çıxıb yenidən girsə, açılışda avtomatik yenidən ONLINE olsun ki,
+   gələn/aktiv sifariş bildirişini qaçırmasın — mövcud "online" dəyişəninin/UI-ın toxunulmadığı,
+   sadəcə eyni toggleStatus() məntiqini bir dəfə işə salan təhlükəsiz bərpa. */
+window.resumeOnlineIfNeeded = function(){
+    let wasOnline = false;
+    try { wasOnline = localStorage.getItem('bakugoWasOnline') === '1'; } catch(e){}
+    if (wasOnline && !online && window.profileComplete) {
+        toggleStatus();
+    }
+};
+
+function openAcc(){document.getElementById('account').classList.add('active');}
+function closeAcc(){document.getElementById('account').classList.remove('active');}
+
+function openModal(id){document.getElementById(id).classList.add('active');}
+function closeModal(id){document.getElementById(id).classList.remove('active');}
+
+function closeOrderModal() {
+    if (window.orderDecisionPending) {
+        const card = document.querySelector('#ordersModal .order-lux');
+        if (card) {
+            card.classList.add('ol-shake');
+            setTimeout(() => card.classList.remove('ol-shake'), 400);
+        }
+        return;
+    }
+    closeModal('ordersModal');
+    stopSoundLoop();
+}
+
+function openOrders(){
+    openModal('ordersModal');
+    const hasActive = document.getElementById('ordersModal').getAttribute('data-current-id');
+    /* Aktiv sifariş varsa "Aktiv Sifariş" tabı, yoxdursa "Çatdırılmış Sifarişlər" tabı avtomatik açılır */
+    showOrderTab(hasActive ? 'active' : 'delivered');
+}
+function openNav(){openModal('navModal');}
+
+function showOrderTab(tab){
+    const section = document.getElementById('prevOrdersSection');
+    const current = document.getElementById('currentOrderSection');
+    const tabActive = document.getElementById('tabActiveOrder');
+    const tabDelivered = document.getElementById('tabDeliveredOrders');
+    if (tab === 'active') {
+        section.style.display = 'none';
+        current.style.display = 'flex';
+        tabActive.classList.add('ol-tab-active');
+        tabDelivered.classList.remove('ol-tab-active');
+    } else {
+        section.style.display = 'block';
+        current.style.display = 'none';
+        tabDelivered.classList.add('ol-tab-active');
+        tabActive.classList.remove('ol-tab-active');
+        if (typeof window.listenPreviousOrders === 'function') window.listenPreviousOrders();
+    }
+}
+
+function setMap(t){
+window.navProvider = t;
+localStorage.setItem('bakugoNavProvider', t);
+applyMapTileStyle(t);
+updateNavProviderUI(t);
+if(t==='google') { toast('🗺 Google Maps seçildi — marşrutlar Google Maps ilə açılacaq'); }
+else if(t==='waze') { toast('🧭 Waze seçildi — marşrutlar Waze ilə açılacaq'); }
+else if(t==='yandex') { toast('📍 Yandex seçildi — marşrutlar Yandex ilə açılacaq'); }
+closeModal('navModal');
+}
+
+function support(){window.open('https://wa.me/994702484852');}
+
+function playSoundLoop(){
+    let sound = document.getElementById('notifSound');
+    let alertDiv = document.getElementById('orderAlert');
+    if(window.notifSoundEnabled !== false){
+        sound.loop = true;
+        sound.play().catch(e => console.log("Autoplay blocked"));
+    }
+    alertDiv.style.display = 'block';
+    if(navigator.vibrate){ navigator.vibrate([500, 200, 500, 200, 500]); }
+}
+
+function stopSoundLoop(){
+    let sound = document.getElementById('notifSound');
+    let alertDiv = document.getElementById('orderAlert');
+    sound.pause();
+    sound.currentTime = 0;
+    sound.loop = false;
+    alertDiv.style.display = 'none';
+}
+
+function enablePremium(){ document.body.classList.add('premium'); }
+
+let isDragging = false;
+const swipeContainer = document.getElementById('acceptBtnBox');
+const thumb = document.getElementById('thumb');
+
+thumb.addEventListener('mousedown', startSlider);
+thumb.addEventListener('touchstart', startSlider);
+
+function startSlider(e) {
+    isDragging = true;
+    document.addEventListener('mousemove', drag);
+    document.addEventListener('mouseup', stopSlider);
+    document.addEventListener('touchmove', drag);
+    document.addEventListener('touchend', stopSlider);
+}
+
+function drag(e) {
+    if (!isDragging) return;
+    let clientX = e.type.includes('touch') ? e.touches[0].clientX : e.clientX;
+    let rect = swipeContainer.getBoundingClientRect();
+    let pos = clientX - rect.left - 25;
+    if (pos > 5 && pos < (swipeContainer.offsetWidth - 55)) { thumb.style.left = pos + 'px'; }
+    if (pos >= (swipeContainer.offsetWidth - 60)) { stopSlider(); acceptOrder(); }
+}
+
+function stopSlider() {
+    isDragging = false;
+    thumb.style.left = '5px';
+    document.removeEventListener('mousemove', drag);
+    document.removeEventListener('mouseup', stopSlider);
+    document.removeEventListener('touchmove', drag);
+    document.removeEventListener('touchend', stopSlider);
+}
+
+/* ===== AKTİV SİFARİŞİN BƏRPASI ===== */
+/* Kuryer artıq qəbul etdiyi (courier_accepted/collected) bir sifariş varkən tətbiqdən
+   çıxıb yenidən girsə belə, bu funksiya sifarişi ekranda (xəritə + kartlar + düymələr
+   ilə birgə) avtomatik bərpa edir. Onlayn olan hər dəfə çağırılır. */
+let unsubscribeMyActiveOrder = null;
+window.listenMyActiveOrder = () => {
+    if (!window.auth || !window.auth.currentUser || !window.db) return;
+    if (unsubscribeMyActiveOrder) unsubscribeMyActiveOrder();
+    const q = window.query(
+        window.collection(window.db, "orders"),
+        window.where("courierId", "==", window.auth.currentUser.uid),
+        window.where("status", "in", ["courier_accepted", "collected"]),
+        window.limit(5)
+    );
+    unsubscribeMyActiveOrder = window.onSnapshot(q, async (snapshot) => {
+        if (snapshot.empty) {
+            // Aktiv sifariş siyahıdan çıxıb: ləğv edilibsə kuryerin ekranını təmizlə
+            const trackedId = window.activeAcceptedOrderId;
+            if (trackedId) {
+                try {
+                    const s = await window.getDoc(window.doc(window.db, "orders", trackedId));
+                    if (s.exists() && s.data().status === "cancelled") {
+                        toast('❌ Aktiv sifariş ləğv edildi.');
+                        window.clearActiveOrderUI();
+                    }
+                } catch (e) { console.error(e); }
+            }
+            return;
+        }
+        window.activeAcceptedOrderId = snapshot.docs[0].id;
+        const d = snapshot.docs[0];
+        window.restoreActiveOrderUI(d.data(), d.id);
+    }, (err) => console.error("Aktiv sifariş bərpası xətası:", err));
+};
+window.stopListeningMyActiveOrder = () => { if (unsubscribeMyActiveOrder) unsubscribeMyActiveOrder(); };
+
+window.restoreActiveOrderUI = (oData, orderId) => {
+    // Kuryer məhz o anda YENİ sifariş qəbul/imtina qərarı verirsə, onun ekranını pozma.
+    if (window.orderDecisionPending) return;
+    // Artıq həmin sifariş ekrandadırsa, hər snapshot yeniləməsində yenidən açıb sıçramasın.
+    const already = document.getElementById('ordersModal').getAttribute('data-current-id') === orderId
+        && document.getElementById('ordersModal').getAttribute('data-restored-active') === '1';
+
+    document.getElementById('orderIdDisplay').innerText = `# ${orderId.substring(0,8)}`;
+    document.getElementById('customerName').innerText = oData.customerName || "Tapılmadı";
+    document.getElementById('customerPhone').innerText = `📞 ${oData.customerPhone || '---'}`;
+    document.getElementById('customerPhone').setAttribute('data-phone', oData.customerPhone || "");
+    document.getElementById('customerAddress').innerText = oData.customerAddress || '---';
+    document.getElementById('restaurantName').innerText = oData.restaurantName || "Tapılmadı";
+    document.getElementById('restaurantAddress').innerText = oData.restaurantAddress || '---';
+    document.getElementById('restaurantPhone').innerText = `📞 ${oData.restaurantPhone || "---"}`;
+    document.getElementById('restaurantPhone').setAttribute('data-phone', oData.restaurantPhone || "");
+    if (typeof window.renderOrderItems === 'function') window.renderOrderItems(oData);
+    window.currentOrderData = oData;
+
+    document.getElementById('ordersModal').setAttribute('data-current-id', orderId);
+    document.getElementById('ordersModal').setAttribute('data-restored-active', '1');
+    const fee = oData.courierFee || 0;
+    document.getElementById('ordersModal').setAttribute('data-order-earn', fee);
+    document.getElementById('price').innerText = `${fee} AZN`;
+
+    document.getElementById('acceptBtnBox').style.display = 'none';
+    document.getElementById('rejectBtn').style.display = 'none';
+    window.clearOrderAutoSkip();
+
+    if (restaurantMarker) map.removeLayer(restaurantMarker);
+    if (window.validCoords(oData.restaurantLat, oData.restaurantLng)) {
+        restaurantMarker = L.marker([oData.restaurantLat, oData.restaurantLng], {icon: luxeGoldIcon('🍽️')}).addTo(map).bindPopup("Restoran");
+    }
+    if (customerMarker) map.removeLayer(customerMarker);
+    if (window.validCoords(oData.customerLat, oData.customerLng)) {
+        customerMarker = L.marker([oData.customerLat, oData.customerLng], {icon: luxeGoldIcon('🏠')}).addTo(map).bindPopup("Müştəri");
+    }
+
+    if (oData.status === 'collected') {
+        updateRoute(oData.customerLat, oData.customerLng);
+        showWazeBtn(oData.customerLat, oData.customerLng);
+        document.getElementById('collectBtnBox').style.display = 'none';
+        document.getElementById('deliverBtnBox').style.display = 'block';
+    } else {
+        updateRoute(oData.restaurantLat, oData.restaurantLng);
+        showWazeBtn(oData.restaurantLat, oData.restaurantLng);
+        document.getElementById('collectBtnBox').style.display = 'block';
+        document.getElementById('deliverBtnBox').style.display = 'none';
+    }
+
+    if (!already) {
+        showOrderTab('active');
+        openModal('ordersModal');
+    }
+};
+
+async function acceptOrder(){
+    const orderId = document.getElementById('ordersModal').getAttribute('data-current-id');
+    const feeText = document.getElementById('price') ? document.getElementById('price').innerText : "";
+    const parsedFee = parseFloat(feeText);
+    // Məsafə hələ hesablanmayıbsa (qiymət "···"), qəbul etmə - əks halda kuryer 0 AZN qazanardı
+    if (isNaN(parsedFee)) {
+        toast('⏳ Məsafə hesablanır, bir neçə saniyə gözləyin.');
+        return;
+    }
+    if (!orderId || !window.auth.currentUser) return;
+
+    window.clearOrderAutoSkip();
+    stopSoundLoop();
+    window.orderDecisionPending = false;
+    const closeBtn = document.getElementById('orderCloseBtn');
+    if (closeBtn) closeBtn.classList.remove('ol-close-disabled');
+
+    const orderRef = window.doc(window.db, "orders", orderId);
+    const uid = window.auth.currentUser.uid;
+    let oData = null;
+    try {
+        // Tranzaksiya: yalnız hələ "searching_courier" olan və kimsə götürməyibsə qəbul olunur.
+        // Beləliklə iki kuryer eyni sifarişi götürə bilməz, ləğv edilmiş sifariş də "dirilə" bilməz.
+        oData = await window.runTransaction(window.db, async (tx) => {
+            const snap = await tx.get(orderRef);
+            if (!snap.exists()) throw new Error("ORDER_GONE");
+            const d = snap.data();
+            if (d.status !== "searching_courier" || d.courierId) throw new Error("ORDER_TAKEN");
+            tx.update(orderRef, {
+                status: "courier_accepted",
+                courierId: uid,
+                courierFee: parsedFee,
+                courierAcceptedAt: Date.now()
+            });
+            return d;
+        });
+    } catch (e) {
+        if (e && (e.message === "ORDER_TAKEN" || e.message === "ORDER_GONE")) {
+            toast('⚠️ Bu sifariş artıq başqa kuryer tərəfindən götürülüb və ya ləğv edilib.');
+            hideWazeBtn();
+            closeModal('ordersModal');
+            document.getElementById('ordersModal').removeAttribute('data-current-id');
+        } else {
+            console.error(e);
+            toast('Xəta baş verdi, yenidən cəhd edin.');
+        }
+        return;
+    }
+
+    window.activeAcceptedOrderId = orderId;
+    window.currentOrderData = oData;
+    if (restaurantMarker) map.removeLayer(restaurantMarker);
+    if (window.validCoords(oData.restaurantLat, oData.restaurantLng)) {
+        restaurantMarker = L.marker([oData.restaurantLat, oData.restaurantLng], {icon: luxeGoldIcon('🍽️')}).addTo(map).bindPopup("Restoran").openPopup();
+    }
+    if (customerMarker) map.removeLayer(customerMarker);
+    if (window.validCoords(oData.customerLat, oData.customerLng)) {
+        customerMarker = L.marker([oData.customerLat, oData.customerLng], {icon: luxeGoldIcon('🏠')}).addTo(map).bindPopup("Müştəri");
+    }
+    updateRoute(oData.restaurantLat, oData.restaurantLng);
+    showWazeBtn(oData.restaurantLat, oData.restaurantLng);
+    toast('✅ Sifariş qəbul edildi! Restorana istiqamətləndirilir.');
+
+    document.getElementById('acceptBtnBox').style.display = 'none';
+    document.getElementById('rejectBtn').style.display = 'none';
+    document.getElementById('collectBtnBox').style.display = 'block';
+}
+
+async function collectOrderAction() {
+    const orderId = document.getElementById('ordersModal').getAttribute('data-current-id');
+    if (!orderId || !window.db || !window.auth.currentUser) return;
+    const orderRef = window.doc(window.db, "orders", orderId);
+    const uid = window.auth.currentUser.uid;
+    let oData = null;
+    try {
+        oData = await window.runTransaction(window.db, async (tx) => {
+            const snap = await tx.get(orderRef);
+            if (!snap.exists()) throw new Error("ORDER_GONE");
+            const d = snap.data();
+            if (d.status === "cancelled") throw new Error("ORDER_CANCELLED");
+            if (d.status !== "courier_accepted" || d.courierId !== uid) throw new Error("ORDER_STATE");
+            tx.update(orderRef, { status: "collected", collectedAt: Date.now() });
+            return d;
+        });
+    } catch (e) {
+        if (e && e.message === "ORDER_CANCELLED") {
+            toast('❌ Bu sifariş ləğv edilib.');
+            window.clearActiveOrderUI();
+        } else {
+            console.error(e);
+            toast('Xəta baş verdi, yenidən cəhd edin.');
+        }
+        return;
+    }
+    window.currentOrderData = oData;
+    updateRoute(oData.customerLat, oData.customerLng);
+    showWazeBtn(oData.customerLat, oData.customerLng);
+    document.getElementById('collectBtnBox').style.display = 'none';
+    document.getElementById('deliverBtnBox').style.display = 'block';
+    toast('🛍️ Sifariş təhvil alındı! Müştəriyə doğru yola düşün.');
+}
+
+/* Aktiv sifariş ləğv edildikdə (admin / müştəri / restoran) kuryerin ekranını təmizləyir */
+window.clearActiveOrderUI = function() {
+    window.activeAcceptedOrderId = null;
+    if (restaurantMarker) { map.removeLayer(restaurantMarker); restaurantMarker = null; }
+    if (customerMarker) { map.removeLayer(customerMarker); customerMarker = null; }
+    try { routingControl.setWaypoints([]); } catch (e) {}
+    hideWazeBtn();
+    document.getElementById('collectBtnBox').style.display = 'none';
+    document.getElementById('deliverBtnBox').style.display = 'none';
+    const m = document.getElementById('ordersModal');
+    m.removeAttribute('data-current-id');
+    m.removeAttribute('data-order-earn');
+    m.removeAttribute('data-restored-active');
+    closeModal('ordersModal');
+};
+
+async function deliverOrderAction() {
+    const orderId = document.getElementById('ordersModal').getAttribute('data-current-id');
+    const earnAttr = document.getElementById('ordersModal').getAttribute('data-order-earn');
+    const attrEarn = parseFloat(earnAttr) || 0;
+    if (!orderId || !window.db || !window.auth.currentUser) return;
+    const uid = window.auth.currentUser.uid;
+    const orderRef = window.doc(window.db, "orders", orderId);
+    const courierRef = window.doc(window.db, "couriers", uid);
+    const previousActiveId = window.activeAcceptedOrderId;
+    window.activeAcceptedOrderId = null; // aktiv sifariş dinləyicisi bunu "ləğv" kimi qəbul etməsin
+    let earnAmount = 0;
+    try {
+        // Tranzaksiya: sifariş yalnız BİR dəfə "delivered" ola bilər və balans yalnız BİR dəfə artır
+        // (düyməyə iki dəfə basılsa və ya şəbəkə təkrarlansa belə).
+        await window.runTransaction(window.db, async (tx) => {
+            const snap = await tx.get(orderRef);
+            if (!snap.exists()) throw new Error("ORDER_GONE");
+            const d = snap.data();
+            if (d.status === "cancelled") throw new Error("ORDER_CANCELLED");
+            if (d.status !== "collected" || d.courierId !== uid) throw new Error("ORDER_STATE");
+            earnAmount = attrEarn > 0 ? attrEarn : (parseFloat(d.courierFee) || 0);
+            tx.update(orderRef, { status: "delivered", deliveredAt: Date.now(), courierEarn: earnAmount });
+            if (earnAmount > 0) {
+                tx.set(courierRef, {
+                    walletBalance: window.increment(earnAmount),
+                    totalEarnings: window.increment(earnAmount)
+                }, { merge: true });
+            }
+        });
+    } catch (e) {
+        window.activeAcceptedOrderId = previousActiveId;
+        if (e && e.message === "ORDER_CANCELLED") {
+            toast('❌ Bu sifariş ləğv edilib.');
+            window.clearActiveOrderUI();
+        } else if (e && e.message === "ORDER_STATE") {
+            toast('Sifarişin statusu dəyişib. Səhifəni yeniləyin.');
+        } else {
+            console.error(e);
+            toast('Xəta: ' + (e && e.message ? e.message : 'bilinməyən xəta'));
+        }
+        return;
+    }
+    if (typeof window.fetchCourierData === 'function') { try { await window.fetchCourierData(); } catch (e) {} }
+    if(restaurantMarker) map.removeLayer(restaurantMarker);
+    if(customerMarker) map.removeLayer(customerMarker);
+    toast(earnAmount > 0 ? `🏁 Çatdırıldı! +${earnAmount.toFixed(2)} AZN balansına əlavə olundu` : '🏁 Çatdırıldı!');
+    document.getElementById('collectBtnBox').style.display = 'none';
+    document.getElementById('deliverBtnBox').style.display = 'none';
+    hideWazeBtn();
+    routingControl.setWaypoints([]);
+    document.getElementById('ordersModal').removeAttribute('data-current-id');
+    document.getElementById('ordersModal').removeAttribute('data-order-earn');
+    document.getElementById('ordersModal').removeAttribute('data-restored-active');
+    /* Çatdırdıqdan sonra modal bağlanmır — kuryer birbaşa "Sifarişlər" (Çatdırılmış
+       Sifarişlər) bölməsinə düşür ki, indicə bitirdiyi sifarişi siyahıda görsün. */
+    showOrderTab('delivered');
+}
+
+async function rejectOrder(){
+    window.clearOrderAutoSkip();
+    const orderId = document.getElementById('ordersModal').getAttribute('data-current-id');
+    if (orderId) {
+        window.skippedOrderIds.add(orderId);
+        window.skippedOrderStamp = window.skippedOrderStamp || {};
+        window.skippedOrderStamp[orderId] = parseFloat(document.getElementById('ordersModal').getAttribute('data-search-stamp')) || Date.now();
+    }
+    stopSoundLoop();
+    window.orderDecisionPending = false;
+    const closeBtn = document.getElementById('orderCloseBtn');
+    if (closeBtn) closeBtn.classList.remove('ol-close-disabled');
+    hideWazeBtn();
+    closeModal('ordersModal');
+    document.getElementById('ordersModal').removeAttribute('data-current-id');
+}
+
+/* ===== 60 SANİYƏLİK AVTOMATİK BAĞLANMA (auto-close) ===== */
+/* Yeni sifariş təklifi açılanda 60 saniyəlik sayğac başlayır (restoranın kuryer axtarışı başladığı
+   andan hesablanır - searchStartedAt). Bu müddətdə heç kim qəbul etməsə: təklif bağlanır və
+   sifarişin kuryer axtarışı bağlanır (status: courier_not_found). Restoran tətbiqində
+   "Yenidən Kuryer Axtar" düyməsi çıxır və basılanda sifariş bütün kuryerlərə yenidən göndərilir. */
+const ORDER_OFFER_SECONDS = 60;
+window.skippedOrderIds = window.skippedOrderIds || new Set();
+window.skippedOrderStamp = window.skippedOrderStamp || {};
+window.orderAutoSkipTimer = null;
+window.orderAutoSkipInterval = null;
+
+window.startOrderAutoSkip = function(orderId, searchStartedAt){
+    window.clearOrderAutoSkip();
+    let remainingMs = ORDER_OFFER_SECONDS * 1000;
+    if (searchStartedAt) remainingMs = Math.max(1000, ORDER_OFFER_SECONDS * 1000 - (Date.now() - searchStartedAt));
+    const endAt = Date.now() + remainingMs;
+    const badge = document.getElementById('orderCountdown');
+    const paint = () => {
+        const left = Math.max(0, Math.ceil((endAt - Date.now()) / 1000));
+        if (badge){
+            badge.innerText = left;
+            badge.classList.add('show');
+            badge.classList.toggle('urgent', left <= 10);
+        }
+    };
+    paint();
+    window.orderAutoSkipInterval = setInterval(paint, 1000);
+    window.orderAutoSkipTimer = setTimeout(() => {
+        window.autoSkipOrder(orderId);
+    }, remainingMs);
+};
+
+window.clearOrderAutoSkip = function(){
+    if (window.orderAutoSkipTimer) { clearTimeout(window.orderAutoSkipTimer); window.orderAutoSkipTimer = null; }
+    if (window.orderAutoSkipInterval) { clearInterval(window.orderAutoSkipInterval); window.orderAutoSkipInterval = null; }
+    const badge = document.getElementById('orderCountdown');
+    if (badge){ badge.classList.remove('show','urgent'); }
+};
+
+/* Axtarış vaxtı bitibsə və hələ heç kim götürməyibsə, sifarişi "kuryer tapılmadı" vəziyyətinə keçirir.
+   Tranzaksiya sayəsində bir neçə kuryerin cihazı eyni anda işləsə də, yalnız bir dəfə dəyişir. */
+window.closeExpiredSearch = async function(orderId){
+    try {
+        const ref = window.doc(window.db, "orders", orderId);
+        await window.runTransaction(window.db, async (tx) => {
+            const snap = await tx.get(ref);
+            if (!snap.exists()) return;
+            const d = snap.data();
+            if (d.status !== "searching_courier" || d.courierId) return;
+            const started = parseFloat(d.searchStartedAt) || 0;
+            if (started && (Date.now() - started) < (ORDER_OFFER_SECONDS * 1000 - 1500)) return;
+            tx.update(ref, { status: "courier_not_found", progress: 45, searchExpiredAt: Date.now() });
+        });
+    } catch (e) { console.error("Axtarışın bağlanması alınmadı:", e); }
+};
+
+window.autoSkipOrder = function(orderId){
+    const modalCurrentId = document.getElementById('ordersModal').getAttribute('data-current-id');
+    if (!window.orderDecisionPending || modalCurrentId !== orderId) return;
+    window.skippedOrderIds.add(orderId);
+    window.skippedOrderStamp[orderId] = parseFloat(document.getElementById('ordersModal').getAttribute('data-search-stamp')) || Date.now();
+    window.clearOrderAutoSkip();
+    stopSoundLoop();
+    window.orderDecisionPending = false;
+    const closeBtn = document.getElementById('orderCloseBtn');
+    if (closeBtn) closeBtn.classList.remove('ol-close-disabled');
+    hideWazeBtn();
+    closeModal('ordersModal');
+    document.getElementById('ordersModal').removeAttribute('data-current-id');
+    window.closeExpiredSearch(orderId);
+    toast('⏱ 60 saniyə ərzində qəbul olunmadı, sifariş bağlandı.');
+};
+
+const cardNumber=document.getElementById('cardNumber');
+cardNumber.addEventListener('input',()=>{
+let value=cardNumber.value.replace(/\s/g,'');
+value=value.replace(/(\d{4})/g,'$1 ').trim();
+cardNumber.value=value;
+document.getElementById('cardPreview').innerText=value || '**** **** **** 0000';
+});
+
+function flipCard(x){ const card=document.getElementById('card3d'); if(x){ card.classList.add('flip'); }else{ card.classList.remove('flip'); } }
+
+/* TƏHLÜKƏSİZLİK: Tam kart nömrəsi (PAN), bitmə tarixi və CVV HEÇ VAXT
+   bazaya (Firestore) və ya hər hansı serverə göndərilmir/saxlanılmır.
+   Bu, PCI-DSS tələblərinin pozulmasının qarşısını alır. Əvəzində yalnız
+   kartın son 4 rəqəmi (identifikasiya üçün) və sahibinin adı saxlanılır.
+   Real ödəniş/balans əməliyyatları üçün lisenziyalı ödəniş provayderi
+   (məs. Payriff, Kapital Bank E-commerce) inteqrasiyası tələb olunur —
+   kart nömrəsi birbaşa o provayderin təhlükəsiz (tokenləşdirmə) sisteminə
+   ötürülməlidir, heç vaxt öz bazanıza deyil. */
+function maskCardNumber(raw){
+    const digits = raw.replace(/\s/g,'');
+    if(digits.length < 4) return null;
+    return digits.slice(-4);
+}
+async function confirmCard(){
+    const cardNumRaw = document.getElementById('cardNumber').value.trim();
+    const cardHolder = document.getElementById('cardName').value.trim();
+    if(!cardNumRaw || !cardHolder){ toast('Zəhmət olmasa bütün xanaları doldurun.'); return; }
+
+    const last4 = maskCardNumber(cardNumRaw);
+    if(!last4){ toast('Kart nömrəsi düzgün deyil.'); return; }
+
+    if(window.auth && window.auth.currentUser && window.db){
+        try{
+            // Yalnız son 4 rəqəm və sahibinin adı saxlanılır — tam nömrə, bitmə
+            // tarixi və CVV bu obyektə DAXİL EDİLMİR və heç bir dəyişəndə saxlanmır.
+            await window.setDoc(window.doc(window.db, "couriers", window.auth.currentUser.uid), {
+                savedCard: { last4: last4, holder: cardHolder, updatedAt: new Date() }
+            }, { merge: true });
+            toast('💳 Kart yadda saxlanıldı (yalnız son 4 rəqəm)');
+        }catch(e){ toast('Xəta: ' + e.message); return; }
+    }
+
+    // Həssas sahələri dərhal formadan və yaddaşdan təmizləyirik
+    document.getElementById('cardNumber').value = '';
+    document.getElementById('cardPreview').innerText = '**** **** **** ' + last4;
+
+    closeModal('cardModal');
+}
+function getLocation(){
+if(navigator.geolocation){
+navigator.geolocation.getCurrentPosition((position)=>{
+map.setView([position.coords.latitude, position.coords.longitude], 16);
+let info=document.getElementById('gpsInfo'); info.classList.add('active'); setTimeout(()=>{ info.classList.remove('active'); },3000);
+});
+}
+}
+</script>
+   
+<audio id="notifSound" src="https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3" preload="auto"></audio>
+</body>
+</html>

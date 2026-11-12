@@ -1,0 +1,59 @@
+# Codemagic — Mac olmadan buludda iOS yığımı və TestFlight / App Store Connect-ə yükləmə.
+# Doldurulmalı: APP_STORE_APPLE_ID, "BakuGo ASC" inteqrasiyası, "firebase_ios" qrupu (README-AZ.md-ə baxın).
+workflows:
+  ios-appstore:
+    name: BakuGo Kuryer — iOS App Store
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    integrations:
+      app_store_connect: BakuGo ASC          # Codemagic → Team → Integrations → App Store Connect açarının adı
+    environment:
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: az.bakugo.kuryer
+      groups:
+        - firebase_ios                        # içində GOOGLE_SERVICE_INFO_PLIST (base64) dəyişəni
+      vars:
+        APP_STORE_APPLE_ID: 0000000000        # App Store Connect → App Information → Apple ID (rəqəm)
+        APP_VERSION: 1.0.0
+      node: 20
+      xcode: latest
+      cocoapods: default
+    triggering:
+      events: [push]
+      branch_patterns:
+        - pattern: main
+    scripts:
+      - name: npm paketləri
+        script: npm install
+      - name: iOS platforması
+        script: |
+          rm -rf ios
+          npx cap add ios
+      - name: GoogleService-Info.plist
+        script: echo "$GOOGLE_SERVICE_INFO_PLIST" | base64 --decode > ios/App/App/GoogleService-Info.plist
+      - name: İkon və splash
+        script: npm run ios:assets
+      - name: iOS konfiqurasiyası
+        script: bash scripts/ios-configure.sh
+      - name: Sync + Pods
+        script: npx cap sync ios
+      - name: İmza profillərini tətbiq et
+        script: xcode-project use-profiles
+      - name: Build nömrəsi
+        script: |
+          cd ios/App
+          LATEST=$(app-store-connect get-latest-app-store-build-number "$APP_STORE_APPLE_ID" 2>/dev/null || echo 0)
+          TF=$(app-store-connect get-latest-testflight-build-number "$APP_STORE_APPLE_ID" 2>/dev/null || echo 0)
+          [ "$TF" -gt "$LATEST" ] && LATEST=$TF
+          agvtool new-version -all $((LATEST + 1))
+      - name: IPA yığ
+        script: xcode-project build-ipa --workspace ios/App/App.xcworkspace --scheme App
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
+        submit_to_app_store: false            # hər şey yoxlanandan sonra true edə bilərsiniz
